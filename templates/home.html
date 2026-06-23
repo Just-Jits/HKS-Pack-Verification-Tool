@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Pack Verify Tool</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; background: #111; color: #fff; padding: 40px; max-width: 700px; margin: 0 auto; }
+    h1 { font-size: 24px; }
+    .store { background: #1d1d1d; padding: 16px; border-radius: 10px; margin-bottom: 10px; }
+    .connected { color: #2ecc71; }
+    a.button { display: inline-block; background: #2ecc71; color: #000; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; margin-top: 20px; }
+    code { background: #222; padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>📦 Pack Verify Tool</h1>
+
+  <h3>Connected stores</h3>
+  {% if shops %}
+    {% for shop in shops %}
+      <div class="store">✅ <span class="connected">{{ shop }}</span></div>
+    {% endfor %}
+  {% else %}
+    <p>No stores connected yet.</p>
+  {% endif %}
+
+  <h3>Connect a new store</h3>
+  <p>Visit: <code>{{ app_url }}/install?shop=your-store.myshopify.com</code></p>
+
+  <a class="button" href="/scan">Go to Scan Screen →</a>
+</body>
+</html>

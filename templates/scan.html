@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pack Verify</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, system-ui, sans-serif;
+      background: #111;
+      color: #fff;
+      margin: 0;
+      padding: 20px;
+      min-height: 100vh;
+    }
+    #scan-input {
+      position: fixed;
+      top: -100px;
+      opacity: 0;
+    }
+    .header {
+      font-size: 14px;
+      color: #888;
+      text-align: center;
+      margin-bottom: 10px;
+    }
+    .idle {
+      text-align: center;
+      padding: 80px 20px;
+      font-size: 28px;
+      color: #555;
+    }
+    .order-card {
+      max-width: 700px;
+      margin: 0 auto;
+    }
+    .order-title {
+      font-size: 32px;
+      font-weight: bold;
+      text-align: center;
+      margin-bottom: 4px;
+    }
+    .order-shop {
+      text-align: center;
+      color: #888;
+      margin-bottom: 20px;
+    }
+    .line-item {
+      background: #1d1d1d;
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 20px;
+      border: 2px solid #333;
+      transition: all 0.15s ease;
+    }
+    .line-item.complete {
+      border-color: #2ecc71;
+      background: #102a1a;
+    }
+    .line-item.flash-green {
+      border-color: #2ecc71;
+      background: #1d6b3d;
+    }
+    .line-item.flash-red {
+      border-color: #e74c3c;
+      background: #6b1d1d;
+    }
+    .qty-badge {
+      font-weight: bold;
+      font-size: 18px;
+      padding: 4px 12px;
+      border-radius: 20px;
+      background: #333;
+    }
+    .qty-badge.complete { background: #2ecc71; color: #000; }
+    .actions {
+      display: flex;
+      gap: 12px;
+      margin-top: 24px;
+      max-width: 700px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    button {
+      flex: 1;
+      padding: 16px;
+      font-size: 18px;
+      border-radius: 10px;
+      border: none;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    #btn-complete {
+      background: #2ecc71;
+      color: #000;
+    }
+    #btn-complete:disabled {
+      background: #2a4a36;
+      color: #555;
+      cursor: not-allowed;
+    }
+    #btn-incomplete {
+      background: #e74c3c;
+      color: #fff;
+    }
+    .missing-picker {
+      max-width: 700px;
+      margin: 20px auto;
+      background: #1d1d1d;
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .missing-picker label {
+      display: block;
+      padding: 10px;
+      font-size: 18px;
+      cursor: pointer;
+    }
+    .missing-picker input { margin-right: 10px; transform: scale(1.5); }
+    .error-banner {
+      max-width: 700px;
+      margin: 0 auto;
+      background: #6b1d1d;
+      padding: 16px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 20px;
+    }
+  </style>
+</head>
+<body>
+  <input type="text" id="scan-input" autofocus>
+  <div class="header">Scan an order barcode to begin</div>
+  <div id="content">
+    <div class="idle">📦 Ready to scan</div>
+  </div>
+
+  <audio id="sound-ding" src="data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=" preload="auto"></audio>
+
+  <script>
+    const input = document.getElementById('scan-input');
+    const content = document.getElementById('content');
+    let currentOrder = null; // { shop, order_id, order_number, line_items: [{...,scanned_count}] }
+    let buffer = "";
+    let bufferTimer = null;
+
+    // keep focus on hidden input always, so scanner keystrokes land here
+    function refocus() { input.focus(); }
+    setInterval(refocus, 500);
+    document.addEventListener('click', refocus);
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        handleScan(input.value.trim());
+        input.value = "";
+      }
+    });
+
+    function beep(type) {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = type === 'good' ? 880 : 200;
+      gain.gain.value = 0.3;
+      osc.start();
+      osc.stop(ctx.currentTime + (type === 'good' ? 0.15 : 0.35));
+    }
+
+    function handleScan(value) {
+      if (!value) return;
+
+      if (!currentOrder) {
+        // treat as order number scan
+        lookupOrder(value);
+        return;
+      }
+
+      // treat as product barcode scan against current order
+      matchProduct(value);
+    }
+
+    async function lookupOrder(orderNumber) {
+      content.innerHTML = `<div class="idle">Looking up order ${orderNumber}...</div>`;
+      try {
+        const res = await fetch(`/api/lookup_order?order_number=${encodeURIComponent(orderNumber)}`);
+        const data = await res.json();
+        if (data.error) {
+          content.innerHTML = `<div class="error-banner">${data.error}</div>`;
+          beep('bad');
+          setTimeout(() => { currentOrder = null; renderIdle(); }, 2500);
+          return;
+        }
+        currentOrder = data;
+        currentOrder.line_items = currentOrder.line_items.map(li => ({...li, scanned_count: 0}));
+        renderOrder();
+      } catch (err) {
+        content.innerHTML = `<div class="error-banner">Network error looking up order</div>`;
+      }
+    }
+
+    function matchProduct(barcode) {
+      const items = currentOrder.line_items;
+      // find an item with this barcode (or sku as fallback) that isn't fully scanned yet
+      let match = items.find(li => (li.barcode === barcode || li.sku === barcode) && li.scanned_count < li.quantity);
+
+      if (!match) {
+        // check if it's a valid item but already fully scanned (over-scan)
+        let overscan = items.find(li => li.barcode === barcode || li.sku === barcode);
+        beep('bad');
+        flashOrderRed();
+        renderOrder(overscan ? `Already scanned all of: ${overscan.title}` : `Not in this order: ${barcode}`);
+        return;
+      }
+
+      match.scanned_count += 1;
+      beep('good');
+      renderOrder();
+
+      const allDone = items.every(li => li.scanned_count >= li.quantity);
+      if (allDone) {
+        document.getElementById('btn-complete').disabled = false;
+      }
+    }
+
+    function flashOrderRed() {
+      // visual handled via re-render message; could enhance with full-screen flash
+    }
+
+    function renderIdle() {
+      content.innerHTML = `<div class="idle">📦 Ready to scan</div>`;
+    }
+
+    function renderOrder(message) {
+      const items = currentOrder.line_items.map(li => {
+        const complete = li.scanned_count >= li.quantity;
+        return `
+          <div class="line-item ${complete ? 'complete' : ''}">
+            <div>${li.title}${li.sku ? ' <span style="color:#888;font-size:14px;">(' + li.sku + ')</span>' : ''}</div>
+            <div class="qty-badge ${complete ? 'complete' : ''}">${li.scanned_count} / ${li.quantity}</div>
+          </div>
+        `;
+      }).join("");
+
+      const allDone = currentOrder.line_items.every(li => li.scanned_count >= li.quantity);
+
+      content.innerHTML = `
+        <div class="order-card">
+          <div class="order-title">Order ${currentOrder.order_number}</div>
+          <div class="order-shop">${currentOrder.shop}${currentOrder.customer ? ' — ' + currentOrder.customer : ''}</div>
+          ${message ? `<div class="error-banner" style="margin-bottom:16px;">${message}</div>` : ""}
+          ${items}
+          <div class="actions">
+            <button id="btn-complete" ${allDone ? "" : "disabled"} onclick="completeOrder()">✅ Mark Ready</button>
+            <button id="btn-incomplete" onclick="showMissingPicker()">⚠️ Missing Item</button>
+          </div>
+          <div id="missing-area"></div>
+        </div>
+      `;
+    }
+
+    function showMissingPicker() {
+      const area = document.getElementById('missing-area');
+      const options = currentOrder.line_items.map((li, idx) => `
+        <label>
+          <input type="checkbox" value="${idx}"> ${li.title} (need ${li.quantity}, have ${li.scanned_count})
+        </label>
+      `).join("");
+      area.innerHTML = `
+        <div class="missing-picker">
+          <div style="margin-bottom:10px; font-weight:bold;">Which item(s) are missing?</div>
+          ${options}
+          <button style="margin-top:10px; background:#e74c3c; color:#fff;" onclick="submitIncomplete()">Confirm — Mark Incomplete</button>
+        </div>
+      `;
+    }
+
+    async function submitIncomplete() {
+      const checked = Array.from(document.querySelectorAll('.missing-picker input:checked'));
+      const missing = checked.map(c => currentOrder.line_items[parseInt(c.value)]);
+
+      await fetch('/api/mark_order', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          shop: currentOrder.shop,
+          order_id: currentOrder.order_id,
+          status: 'incomplete',
+          missing_items: missing.map(m => ({title: m.title, sku: m.sku}))
+        })
+      });
+
+      currentOrder = null;
+      renderIdle();
+    }
+
+    async function completeOrder() {
+      await fetch('/api/mark_order', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          shop: currentOrder.shop,
+          order_id: currentOrder.order_id,
+          status: 'ready'
+        })
+      });
+
+      currentOrder = null;
+      renderIdle();
+    }
+  </script>
+</body>
+</html>
