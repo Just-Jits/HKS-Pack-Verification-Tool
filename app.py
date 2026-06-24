@@ -19,6 +19,28 @@ API_VERSION = "2026-04"
 TOKENS_FILE = "/data/tokens.json"  # mount a Railway volume at /data for this to persist
 
 
+LOGS_FILE = "/data/error_log.json"
+
+
+def log_error(context, detail):
+    try:
+        logs = []
+        if os.path.exists(LOGS_FILE):
+            with open(LOGS_FILE, "r") as f:
+                logs = json.load(f)
+        logs.append({
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "context": context,
+            "detail": str(detail)[:2000],  # cap length so one giant error doesn't bloat the file
+        })
+        logs = logs[-200:]  # keep last 200 entries only
+        os.makedirs(os.path.dirname(LOGS_FILE), exist_ok=True)
+        with open(LOGS_FILE, "w") as f:
+            json.dump(logs, f, indent=2)
+    except Exception:
+        pass  # logging itself should never crash the app
+
+
 # ---------- token storage ----------
 
 def load_tokens():
@@ -185,83 +207,133 @@ def api_lookup_order():
     if not order_number:
         return jsonify({"error": "no order number provided"}), 400
 
-    shop, order = find_order_by_number(order_number)
-    if not order:
-        return jsonify({"error": f"Order #{order_number} not found in any connected store"}), 404
+    try:
+        shop, order = find_order_by_number(order_number)
+        if not order:
+            return jsonify({"error": f"Order #{order_number} not found in any connected store"}), 404
 
-    line_items = []
-    for li in order["line_items"]:
-        line_items.append({
-            "id": li["id"],
-            "title": li["title"],
-            "sku": li.get("sku"),
-            "quantity": li["quantity"],
-            "barcode": li.get("barcode"),  # may be null depending on product setup
+        line_items = []
+        for li in order["line_items"]:
+            line_items.append({
+                "id": li["id"],
+                "title": li["title"],
+                "sku": li.get("sku"),
+                "quantity": li["quantity"],
+                "barcode": li.get("barcode"),
+            })
+
+        shipping_address = order.get("shipping_address") or {}
+        shipping_country = shipping_address.get("country_code", "")
+        is_international = shipping_country not in ("AU", "")
+        estimated_weight = estimate_order_weight(line_items)
+        tags_raw = order.get("tags") or ""
+        needs_express_tag = "express-upgrade" in [t.strip().lower() for t in tags_raw.split(",")]
+
+        weight_warning = None
+        if is_international and estimated_weight > 2:
+            weight_warning = "International parcel est. over 2kg — check if Express upgrade is needed"
+        elif not is_international and estimated_weight > 5:
+            weight_warning = "Domestic parcel est. over 5kg — check if it needs splitting into 2 satchels"
+
+        return jsonify({
+            "shop": shop,
+            "order_id": order["id"],
+            "order_number": order["name"],
+            "customer": shipping_address.get("name", ""),
+            "is_international": is_international,
+            "estimated_weight_kg": estimated_weight,
+            "weight_warning": weight_warning,
+            "needs_express_tag": needs_express_tag,
+            "line_items": line_items,
         })
-
-    shipping_address = order.get("shipping_address") or {}
-    shipping_country = shipping_address.get("country_code", "")
-    is_international = shipping_country not in ("AU", "")
-    estimated_weight = estimate_order_weight(line_items)
-    tags_raw = order.get("tags") or ""
-    needs_express_tag = "express-upgrade" in [t.strip().lower() for t in tags_raw.split(",")]
-
-    weight_warning = None
-    if is_international and estimated_weight > 2:
-        weight_warning = "International parcel est. over 2kg — check if Express upgrade is needed"
-    elif not is_international and estimated_weight > 5:
-        weight_warning = "Domestic parcel est. over 5kg — check if it needs splitting into 2 satchels"
-
-    return jsonify({
-        "shop": shop,
-        "order_id": order["id"],
-        "order_number": order["name"],
-        "customer": shipping_address.get("name", ""),
-        "is_international": is_international,
-        "estimated_weight_kg": estimated_weight,
-        "weight_warning": weight_warning,
-        "needs_express_tag": needs_express_tag,
-        "line_items": line_items,
-    })
+    except Exception as e:
+        log_error("lookup_order", f"order_number={order_number} | {e}")
+        return jsonify({"error": f"Internal error looking up order — see /logs for detail"}), 500
 
 
 @app.route("/api/mark_order", methods=["POST"])
 def api_mark_order():
-    body = request.get_json()
-    shop = body["shop"]
-    order_id = body["order_id"]
-    status = body["status"]  # "ready" or "incomplete"
-    missing_items = body.get("missing_items", [])  # list of {title, sku} for incomplete
+    try:
+        body = request.get_json()
+        shop = body["shop"]
+        order_id = body["order_id"]
+        status = body["status"]
+        missing_items = body.get("missing_items", [])
 
-    tag = "packed-ready" if status == "ready" else "packed-incomplete"
+        tag = "packed-ready" if status == "ready" else "packed-incomplete"
 
-    # fetch current tags so we don't wipe existing ones
-    current = shopify_get(shop, f"orders/{order_id}.json")
-    existing_tags = (current["order"].get("tags") or "") if current else ""
-    tag_list = [t.strip() for t in existing_tags.split(",") if t.strip()]
-    if tag not in tag_list:
-        tag_list.append(tag)
+        current = shopify_get(shop, f"orders/{order_id}.json")
+        if not current:
+            log_error("mark_order", f"shop={shop} order_id={order_id} | failed to fetch current order — check token/scopes")
+            return jsonify({"error": "Could not fetch order from Shopify — see /logs", "ok": False}), 500
 
-    note_addition = ""
-    if status == "incomplete" and missing_items:
-        names = ", ".join(i["title"] for i in missing_items)
-        note_addition = f"\n[Pack Verify] Missing at pack time: {names}"
+        existing_tags = (current["order"].get("tags") or "")
+        tag_list = [t.strip() for t in existing_tags.split(",") if t.strip()]
+        if tag not in tag_list:
+            tag_list.append(tag)
 
-    payload = {
-        "order": {
-            "id": order_id,
-            "tags": ", ".join(tag_list),
+        note_addition = ""
+        if status == "incomplete" and missing_items:
+            names = ", ".join(i["title"] for i in missing_items)
+            note_addition = f"\n[Pack Verify] Missing at pack time: {names}"
+
+        payload = {
+            "order": {
+                "id": order_id,
+                "tags": ", ".join(tag_list),
+            }
         }
-    }
-    if note_addition:
-        current_note = (current["order"].get("note") or "") if current else ""
-        payload["order"]["note"] = current_note + note_addition
+        if note_addition:
+            current_note = (current["order"].get("note") or "")
+            payload["order"]["note"] = current_note + note_addition
 
-    status_code, resp = shopify_put(shop, f"orders/{order_id}.json", payload)
-    if status_code not in (200, 201):
-        return jsonify({"error": "failed to tag order", "detail": resp}), 500
+        status_code, resp = shopify_put(shop, f"orders/{order_id}.json", payload)
+        if status_code not in (200, 201):
+            log_error("mark_order", f"shop={shop} order_id={order_id} | Shopify returned {status_code}: {resp}")
+            return jsonify({"error": "failed to tag order — see /logs", "detail": resp, "ok": False}), 500
 
-    return jsonify({"ok": True})
+        return jsonify({"ok": True})
+    except Exception as e:
+        log_error("mark_order", str(e))
+        return jsonify({"error": f"Internal error — see /logs", "ok": False}), 500
+
+
+@app.route("/admin/reveal_token")
+def reveal_token():
+    secret = request.args.get("secret")
+    if secret != os.environ.get("ADMIN_SECRET", "change-me"):
+        return "Forbidden", 403
+    shop = request.args.get("shop")
+    token = get_token_for_shop(shop)
+    if not token:
+        return f"No token stored for {shop}", 404
+    return f"Token for {shop}:\n{token}\n\nScopes: {load_tokens().get(shop, {}).get('scope')}"
+def view_logs():
+    logs = []
+    if os.path.exists(LOGS_FILE):
+        with open(LOGS_FILE, "r") as f:
+            logs = json.load(f)
+    logs = list(reversed(logs))
+    rows = "".join(
+        f"<tr><td>{l['timestamp']}</td><td>{l['context']}</td>"
+        f"<td><pre style='white-space:pre-wrap;margin:0;'>{l['detail']}</pre></td></tr>"
+        for l in logs
+    )
+    return f"""
+    <html><head><title>Pack Verify — Error Log</title>
+    <style>
+      body {{ font-family: monospace; background:#111; color:#eee; padding:20px; }}
+      table {{ width:100%; border-collapse: collapse; }}
+      td {{ border-bottom:1px solid #333; padding:8px; vertical-align:top; }}
+      td:first-child {{ white-space:nowrap; color:#888; }}
+      td:nth-child(2) {{ white-space:nowrap; color:#e7a23c; font-weight:bold; }}
+    </style>
+    </head><body>
+    <h2>Error Log (most recent first, last 200 kept)</h2>
+    <p>Refresh this page any time something looks wrong on the scan screen.</p>
+    <table>{rows if rows else "<tr><td colspan=3>No errors logged yet 🎉</td></tr>"}</table>
+    </body></html>
+    """
 
 
 if __name__ == "__main__":
