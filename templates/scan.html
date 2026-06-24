@@ -73,9 +73,11 @@
     .qty-badge {
       font-weight: bold;
       font-size: 18px;
-      padding: 4px 12px;
+      padding: 4px 14px;
       border-radius: 20px;
       background: #333;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
     .qty-badge.complete { background: #2ecc71; color: #000; }
     .manual-confirm {
@@ -140,11 +142,56 @@
       text-align: center;
       font-size: 20px;
     }
+    .warn-banner {
+      max-width: 700px;
+      margin: 0 auto 16px auto;
+      background: #4a3a10;
+      border: 2px solid #e7a23c;
+      padding: 14px 20px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 18px;
+      color: #f0c47a;
+    }
+    .express-banner {
+      max-width: 700px;
+      margin: 0 auto 16px auto;
+      background: #5a1a1a;
+      border: 2px solid #ff4d4d;
+      padding: 16px 20px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 19px;
+      font-weight: bold;
+      color: #ffb3b3;
+    }
+    .express-banner button {
+      margin-top: 10px;
+      background: #ff4d4d;
+      color: #fff;
+    }
+    #visible-input-wrap {
+      max-width: 700px;
+      margin: 0 auto 16px auto;
+      text-align: center;
+    }
+    #visible-input {
+      background: #1d1d1d;
+      border: 1px solid #444;
+      color: #fff;
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-size: 16px;
+      width: 260px;
+    }
   </style>
 </head>
 <body>
   <input type="text" id="scan-input" autofocus>
   <div class="header">Scan an order barcode to begin</div>
+  <div id="visible-input-wrap">
+    <input type="text" id="visible-input" placeholder="Or type order/product number here">
+  </div>
   <div id="content">
     <div class="idle">📦 Ready to scan</div>
   </div>
@@ -158,16 +205,32 @@
     let buffer = "";
     let bufferTimer = null;
 
-    // keep focus on hidden input always, so scanner keystrokes land here
-    function refocus() { input.focus(); }
+    // keep focus on hidden input always, so scanner keystrokes land here —
+    // but don't steal focus if the person is actively using the visible fallback field
+    function refocus() {
+      if (document.activeElement !== visibleInput) {
+        input.focus();
+      }
+    }
     setInterval(refocus, 500);
-    document.addEventListener('click', refocus);
+    document.addEventListener('click', (e) => {
+      if (e.target !== visibleInput) refocus();
+    });
 
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
         handleScan(input.value.trim());
         input.value = "";
+      }
+    });
+
+    const visibleInput = document.getElementById('visible-input');
+    visibleInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        handleScan(visibleInput.value.trim());
+        visibleInput.value = "";
       }
     });
 
@@ -232,11 +295,6 @@
       match.scanned_count += 1;
       beep('good');
       renderOrder();
-
-      const allDone = items.every(li => li.scanned_count >= li.quantity);
-      if (allDone) {
-        document.getElementById('btn-complete').disabled = false;
-      }
     }
 
     function flashOrderRed() {
@@ -247,13 +305,19 @@
       content.innerHTML = `<div class="idle">📦 Ready to scan</div>`;
     }
 
+    function resetItem(idx) {
+      const li = currentOrder.line_items[idx];
+      if (li.scanned_count > 0) {
+        li.scanned_count -= 1;
+      }
+      renderOrder();
+    }
+
     function manualConfirm(idx) {
       const li = currentOrder.line_items[idx];
       li.scanned_count = li.quantity;
       beep('good');
       renderOrder();
-      const allDone = currentOrder.line_items.every(l => l.scanned_count >= l.quantity);
-      if (allDone) document.getElementById('btn-complete').disabled = false;
     }
 
     function renderOrder(message) {
@@ -267,7 +331,7 @@
               ${noBarcode ? '<div style="color:#e7a23c;font-size:13px;margin-top:4px;">No barcode on file — tap Confirm to verify by hand</div>' : ''}
             </div>
             <div style="display:flex; align-items:center; gap:10px;">
-              <div class="qty-badge ${complete ? 'complete' : ''}">${li.scanned_count} / ${li.quantity}</div>
+              <div class="qty-badge ${complete ? 'complete' : ''}" onclick="resetItem(${idx})" style="cursor:pointer;" title="Tap to undo last scan">${li.scanned_count} / ${li.quantity}</div>
               ${!complete ? `<button class="manual-confirm" onclick="manualConfirm(${idx})">Confirm</button>` : ''}
             </div>
           </div>
@@ -275,20 +339,48 @@
       }).join("");
 
       const allDone = currentOrder.line_items.every(li => li.scanned_count >= li.quantity);
+      const expressBlocked = currentOrder.needs_express_tag && !currentOrder.express_confirmed;
+      const canMarkReady = allDone && !expressBlocked;
+
+      let weightBannerHtml = "";
+      if (currentOrder.weight_warning) {
+        weightBannerHtml = `<div class="warn-banner">⚠️ ${currentOrder.weight_warning} (est. ${currentOrder.estimated_weight_kg}kg)</div>`;
+      }
+
+      let expressBannerHtml = "";
+      if (currentOrder.needs_express_tag) {
+        if (currentOrder.express_confirmed) {
+          expressBannerHtml = `<div class="warn-banner">✅ Express upgrade confirmed in AusPost</div>`;
+        } else {
+          expressBannerHtml = `
+            <div class="express-banner">
+              🚀 EXPRESS REQUIRED — go set this order to Express in the AusPost app before packing<br>
+              <button onclick="confirmExpress()">✅ I've set this to Express</button>
+            </div>
+          `;
+        }
+      }
 
       content.innerHTML = `
         <div class="order-card">
           <div class="order-title">Order ${currentOrder.order_number}</div>
           <div class="order-shop">${currentOrder.shop}${currentOrder.customer ? ' — ' + currentOrder.customer : ''}</div>
+          ${expressBannerHtml}
+          ${weightBannerHtml}
           ${message ? `<div class="error-banner" style="margin-bottom:16px;">${message}</div>` : ""}
           ${items}
           <div class="actions">
-            <button id="btn-complete" ${allDone ? "" : "disabled"} onclick="completeOrder()">✅ Mark Ready</button>
+            <button id="btn-complete" ${canMarkReady ? "" : "disabled"} onclick="completeOrder()">✅ Mark Ready</button>
             <button id="btn-incomplete" onclick="showMissingPicker()">⚠️ Missing Item</button>
           </div>
           <div id="missing-area"></div>
         </div>
       `;
+    }
+
+    function confirmExpress() {
+      currentOrder.express_confirmed = true;
+      renderOrder();
     }
 
     function showMissingPicker() {

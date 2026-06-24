@@ -122,6 +122,33 @@ def shopify_post(shop, path, payload):
     return r.status_code, (r.json() if r.text else {})
 
 
+WEIGHT_TABLE = [
+    # (keywords to match in product title, lowercase), weight_kg
+    (["gi"], 1.7),
+    (["rashguard", "rash guard"], 0.3),
+    (["shorts"], 0.3),
+    (["hoodie"], 1.0),
+    (["gear bag", "gearbag"], 1.0),
+    (["belt"], 0.3),
+]
+DEFAULT_ITEM_WEIGHT_KG = 0.3  # fallback for anything unmatched
+
+
+def estimate_item_weight(title):
+    title_lower = title.lower()
+    for keywords, weight in WEIGHT_TABLE:
+        if any(kw in title_lower for kw in keywords):
+            return weight
+    return DEFAULT_ITEM_WEIGHT_KG
+
+
+def estimate_order_weight(line_items):
+    total = 0.0
+    for li in line_items:
+        total += estimate_item_weight(li["title"]) * li["quantity"]
+    return round(total, 2)
+
+
 # ---------- core: find order across all connected stores ----------
 
 def find_order_by_number(order_number):
@@ -165,11 +192,26 @@ def api_lookup_order():
             "barcode": li.get("barcode"),  # may be null depending on product setup
         })
 
+    shipping_country = order.get("shipping_address", {}).get("country_code", "")
+    is_international = shipping_country not in ("AU", "")
+    estimated_weight = estimate_order_weight(line_items)
+    needs_express_tag = "express-upgrade" in [t.strip().lower() for t in order.get("tags", "").split(",")]
+
+    weight_warning = None
+    if is_international and estimated_weight > 2:
+        weight_warning = "International parcel est. over 2kg — check if Express upgrade is needed"
+    elif not is_international and estimated_weight > 5:
+        weight_warning = "Domestic parcel est. over 5kg — check if it needs splitting into 2 satchels"
+
     return jsonify({
         "shop": shop,
         "order_id": order["id"],
         "order_number": order["name"],
         "customer": order.get("shipping_address", {}).get("name", ""),
+        "is_international": is_international,
+        "estimated_weight_kg": estimated_weight,
+        "weight_warning": weight_warning,
+        "needs_express_tag": needs_express_tag,
         "line_items": line_items,
     })
 
