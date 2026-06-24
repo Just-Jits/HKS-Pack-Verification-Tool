@@ -315,7 +315,7 @@
 
     function manualConfirm(idx) {
       const li = currentOrder.line_items[idx];
-      li.scanned_count = li.quantity;
+      li.scanned_count = Math.min(li.scanned_count + 1, li.quantity);
       beep('good');
       renderOrder();
     }
@@ -403,7 +403,7 @@
       const checked = Array.from(document.querySelectorAll('.missing-picker input:checked'));
       const missing = checked.map(c => currentOrder.line_items[parseInt(c.value)]);
 
-      await fetch('/api/mark_order', {
+      const res = await fetch('/api/mark_order', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -413,13 +413,18 @@
           missing_items: missing.map(m => ({title: m.title, sku: m.sku}))
         })
       });
+      const data = await res.json();
+      if (!data.ok) {
+        alert('Failed to tag order as incomplete: ' + JSON.stringify(data.detail || data.error));
+        return;
+      }
 
       currentOrder = null;
       renderIdle();
     }
 
     async function completeOrder() {
-      await fetch('/api/mark_order', {
+      const res = await fetch('/api/mark_order', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -428,6 +433,11 @@
           status: 'ready'
         })
       });
+      const data = await res.json();
+      if (!data.ok) {
+        alert('Failed to mark order ready: ' + JSON.stringify(data.detail || data.error));
+        return;
+      }
 
       currentOrder = null;
       renderIdle();

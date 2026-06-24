@@ -122,6 +122,13 @@ def shopify_post(shop, path, payload):
     return r.status_code, (r.json() if r.text else {})
 
 
+def shopify_put(shop, path, payload):
+    token = get_token_for_shop(shop)
+    url = f"https://{shop}/admin/api/{API_VERSION}/{path}"
+    r = requests.put(url, headers={"X-Shopify-Access-Token": token}, json=payload)
+    return r.status_code, (r.json() if r.text else {})
+
+
 WEIGHT_TABLE = [
     # (keywords to match in product title, lowercase), weight_kg
     (["gi"], 1.7),
@@ -250,7 +257,7 @@ def api_mark_order():
         current_note = (current["order"].get("note") or "") if current else ""
         payload["order"]["note"] = current_note + note_addition
 
-    status_code, resp = shopify_post(shop, f"orders/{order_id}.json", payload)
+    status_code, resp = shopify_put(shop, f"orders/{order_id}.json", payload)
     if status_code not in (200, 201):
         return jsonify({"error": "failed to tag order", "detail": resp}), 500
 
