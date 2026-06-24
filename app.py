@@ -10,11 +10,32 @@ from urllib.parse import urlencode
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-me-in-railway-env")
 
-CLIENT_ID = os.environ["SHOPIFY_CLIENT_ID"]
-CLIENT_SECRET = os.environ["SHOPIFY_CLIENT_SECRET"]
+CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID")  # fallback/default app
+CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET")  # fallback/default app
 APP_URL = os.environ["APP_URL"]  # e.g. https://pack-verify-tool-production.up.railway.app
 SCOPES = "read_orders,read_products,write_orders"
 API_VERSION = "2026-04"
+
+# Shopify only allows ONE custom app to cover multiple stores if they're in
+# the same Plus organization. Since these are 5 separate standalone stores,
+# each one needs its OWN custom app (own Client ID + Secret). Rather than
+# hardcoding one pair, store a JSON mapping of shop -> {client_id, client_secret}
+# in the SHOPIFY_APPS_JSON env var, e.g.:
+#   {"hooks-jiu-jitsu.myshopify.com": {"client_id": "...", "client_secret": "..."},
+#    "justjits.myshopify.com": {"client_id": "...", "client_secret": "..."}}
+try:
+    SHOPIFY_APPS = json.loads(os.environ.get("SHOPIFY_APPS_JSON", "{}"))
+except json.JSONDecodeError:
+    SHOPIFY_APPS = {}
+
+
+def get_app_credentials(shop):
+    """Returns (client_id, client_secret) for a given shop — checks the
+    per-shop mapping first, falls back to the single default app credentials
+    for backward compatibility with the original Hooks setup."""
+    if shop in SHOPIFY_APPS:
+        return SHOPIFY_APPS[shop]["client_id"], SHOPIFY_APPS[shop]["client_secret"]
+    return CLIENT_ID, CLIENT_SECRET
 
 TOKENS_FILE = "/data/tokens.json"  # mount a Railway volume at /data for this to persist
 
@@ -73,12 +94,16 @@ def install():
     if not shop:
         return "Missing ?shop=your-store.myshopify.com in the URL", 400
 
+    client_id, _ = get_app_credentials(shop)
+    if not client_id:
+        return f"No app configured for {shop} — add it to SHOPIFY_APPS_JSON in Railway", 400
+
     state = hashlib.sha256(os.urandom(16)).hexdigest()
     session["state"] = state
     session["shop"] = shop
 
     params = {
-        "client_id": CLIENT_ID,
+        "client_id": client_id,
         "scope": SCOPES,
         "redirect_uri": f"{APP_URL}/auth/callback",
         "state": state,
@@ -96,13 +121,17 @@ def auth_callback():
     if state != session.get("state"):
         return "Invalid state — please restart install", 400
 
+    client_id, client_secret = get_app_credentials(shop)
+    if not client_id:
+        return f"No app configured for {shop}", 400
+
     # exchange code for permanent-ish access token (Authorization Code Grant ->
     # this returns a long-lived token for live stores, unlike client_credentials)
     resp = requests.post(
         f"https://{shop}/admin/oauth/access_token",
         json={
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
+            "client_id": client_id,
+            "client_secret": client_secret,
             "code": code,
         },
     )
