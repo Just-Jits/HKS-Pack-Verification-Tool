@@ -274,7 +274,7 @@
         currentOrder.line_items = currentOrder.line_items.map(li => ({...li, scanned_count: 0}));
         renderOrder();
       } catch (err) {
-        content.innerHTML = `<div class="error-banner">Network error looking up order</div>`;
+        content.innerHTML = `<div class="error-banner">Error: ${err.message || 'failed to reach server'}</div>`;
       }
     }
 

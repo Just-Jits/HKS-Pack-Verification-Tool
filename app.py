@@ -192,10 +192,12 @@ def api_lookup_order():
             "barcode": li.get("barcode"),  # may be null depending on product setup
         })
 
-    shipping_country = order.get("shipping_address", {}).get("country_code", "")
+    shipping_address = order.get("shipping_address") or {}
+    shipping_country = shipping_address.get("country_code", "")
     is_international = shipping_country not in ("AU", "")
     estimated_weight = estimate_order_weight(line_items)
-    needs_express_tag = "express-upgrade" in [t.strip().lower() for t in order.get("tags", "").split(",")]
+    tags_raw = order.get("tags") or ""
+    needs_express_tag = "express-upgrade" in [t.strip().lower() for t in tags_raw.split(",")]
 
     weight_warning = None
     if is_international and estimated_weight > 2:
@@ -207,7 +209,7 @@ def api_lookup_order():
         "shop": shop,
         "order_id": order["id"],
         "order_number": order["name"],
-        "customer": order.get("shipping_address", {}).get("name", ""),
+        "customer": shipping_address.get("name", ""),
         "is_international": is_international,
         "estimated_weight_kg": estimated_weight,
         "weight_warning": weight_warning,
@@ -228,7 +230,7 @@ def api_mark_order():
 
     # fetch current tags so we don't wipe existing ones
     current = shopify_get(shop, f"orders/{order_id}.json")
-    existing_tags = current["order"].get("tags", "") if current else ""
+    existing_tags = (current["order"].get("tags") or "") if current else ""
     tag_list = [t.strip() for t in existing_tags.split(",") if t.strip()]
     if tag not in tag_list:
         tag_list.append(tag)
@@ -245,7 +247,7 @@ def api_mark_order():
         }
     }
     if note_addition:
-        current_note = current["order"].get("note", "") or ""
+        current_note = (current["order"].get("note") or "") if current else ""
         payload["order"]["note"] = current_note + note_addition
 
     status_code, resp = shopify_post(shop, f"orders/{order_id}.json", payload)
