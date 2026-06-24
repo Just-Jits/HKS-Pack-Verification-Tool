@@ -78,6 +78,15 @@
       background: #333;
     }
     .qty-badge.complete { background: #2ecc71; color: #000; }
+    .manual-confirm {
+      flex: none;
+      padding: 8px 14px;
+      font-size: 13px;
+      background: #333;
+      color: #ccc;
+      border-radius: 6px;
+    }
+    .manual-confirm:hover { background: #444; }
     .actions {
       display: flex;
       gap: 12px;
@@ -238,13 +247,29 @@
       content.innerHTML = `<div class="idle">📦 Ready to scan</div>`;
     }
 
+    function manualConfirm(idx) {
+      const li = currentOrder.line_items[idx];
+      li.scanned_count = li.quantity;
+      beep('good');
+      renderOrder();
+      const allDone = currentOrder.line_items.every(l => l.scanned_count >= l.quantity);
+      if (allDone) document.getElementById('btn-complete').disabled = false;
+    }
+
     function renderOrder(message) {
-      const items = currentOrder.line_items.map(li => {
+      const items = currentOrder.line_items.map((li, idx) => {
         const complete = li.scanned_count >= li.quantity;
+        const noBarcode = !li.barcode;
         return `
           <div class="line-item ${complete ? 'complete' : ''}">
-            <div>${li.title}${li.sku ? ' <span style="color:#888;font-size:14px;">(' + li.sku + ')</span>' : ''}</div>
-            <div class="qty-badge ${complete ? 'complete' : ''}">${li.scanned_count} / ${li.quantity}</div>
+            <div>
+              ${li.title}${li.sku ? ' <span style="color:#888;font-size:14px;">(' + li.sku + ')</span>' : ''}
+              ${noBarcode ? '<div style="color:#e7a23c;font-size:13px;margin-top:4px;">No barcode on file — tap Confirm to verify by hand</div>' : ''}
+            </div>
+            <div style="display:flex; align-items:center; gap:10px;">
+              <div class="qty-badge ${complete ? 'complete' : ''}">${li.scanned_count} / ${li.quantity}</div>
+              ${!complete ? `<button class="manual-confirm" onclick="manualConfirm(${idx})">Confirm</button>` : ''}
+            </div>
           </div>
         `;
       }).join("");
