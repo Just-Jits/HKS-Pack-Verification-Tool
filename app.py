@@ -13,7 +13,7 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-me-in-railway-env")
 CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID")  # fallback/default app
 CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET")  # fallback/default app
 APP_URL = os.environ["APP_URL"]  # e.g. https://pack-verify-tool-production.up.railway.app
-SCOPES = "read_orders,read_products,write_orders"
+SCOPES = "read_orders,write_orders,read_products,write_products"
 API_VERSION = "2026-04"
 
 # Shopify only allows ONE custom app to cover multiple stores if they're in
