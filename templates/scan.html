@@ -191,6 +191,7 @@
   <div class="header">Scan an order barcode to begin</div>
   <div id="visible-input-wrap">
     <input type="text" id="visible-input" placeholder="Or type order/product number here">
+    <button id="new-order-btn" onclick="startNewOrder()" style="margin-left:10px; padding:10px 16px; background:#333; color:#fff; border-radius:8px;">🔄 New Order</button>
   </div>
   <div id="content">
     <div class="idle">📦 Ready to scan</div>
@@ -246,6 +247,11 @@
       osc.stop(ctx.currentTime + (type === 'good' ? 0.15 : 0.35));
     }
 
+    function startNewOrder() {
+      currentOrder = null;
+      renderIdle();
+    }
+
     function handleScan(value) {
       if (!value) return;
 
@@ -265,9 +271,10 @@
         const res = await fetch(`/api/lookup_order?order_number=${encodeURIComponent(orderNumber)}`);
         const data = await res.json();
         if (data.error) {
+          currentOrder = null;
           content.innerHTML = `<div class="error-banner">${data.error}</div>`;
           beep('bad');
-          setTimeout(() => { currentOrder = null; renderIdle(); }, 2500);
+          setTimeout(() => { renderIdle(); }, 2000);
           return;
         }
         currentOrder = data;

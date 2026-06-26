@@ -207,6 +207,22 @@ def estimate_order_weight(line_items):
     return round(total, 2)
 
 
+def lookup_live_barcode(shop, sku):
+    if not sku:
+        return None
+    token = get_token_for_shop(shop)
+    if not token:
+        return None
+    url = f"https://{shop}/admin/api/{API_VERSION}/variants.json"
+    r = requests.get(url, headers={"X-Shopify-Access-Token": token}, params={"sku": sku}, timeout=15)
+    if r.status_code != 200:
+        return None
+    variants = r.json().get("variants", [])
+    if variants:
+        return variants[0].get("barcode")
+    return None
+
+
 # ---------- core: find order across all connected stores ----------
 
 def find_order_by_number(order_number):
@@ -243,12 +259,15 @@ def api_lookup_order():
 
         line_items = []
         for li in order["line_items"]:
+            barcode = li.get("barcode")
+            if not barcode:
+                barcode = lookup_live_barcode(shop, li.get("sku"))
             line_items.append({
                 "id": li["id"],
                 "title": li["title"],
                 "sku": li.get("sku"),
                 "quantity": li["quantity"],
-                "barcode": li.get("barcode"),
+                "barcode": barcode,
             })
 
         shipping_address = order.get("shipping_address") or {}
@@ -367,5 +386,3 @@ def view_logs():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
-# v2
