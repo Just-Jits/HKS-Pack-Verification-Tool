@@ -208,18 +208,40 @@ def estimate_order_weight(line_items):
 
 
 def lookup_live_barcode(shop, sku):
+    """REST's /variants.json?sku= filter is unreliable (doesn't actually
+    filter), so use GraphQL's productVariants(query: "sku:...") instead,
+    which properly filters server-side."""
     if not sku:
         return None
     token = get_token_for_shop(shop)
     if not token:
         return None
-    url = f"https://{shop}/admin/api/{API_VERSION}/variants.json"
-    r = requests.get(url, headers={"X-Shopify-Access-Token": token}, params={"sku": sku}, timeout=15)
-    if r.status_code != 200:
-        return None
-    variants = r.json().get("variants", [])
-    if variants:
-        return variants[0].get("barcode")
+    url = f"https://{shop}/admin/api/{API_VERSION}/graphql.json"
+    query = """
+    query getVariantBySku($q: String!) {
+      productVariants(first: 1, query: $q) {
+        edges { node { barcode sku } }
+      }
+    }
+    """
+    # Shopify search syntax requires exact-match quoting for SKUs that may
+    # contain special characters like hyphens.
+    safe_sku = sku.replace('"', '\\"')
+    variables = {"q": f'sku:"{safe_sku}"'}
+    try:
+        r = requests.post(
+            url,
+            headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
+            json={"query": query, "variables": variables},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        edges = r.json().get("data", {}).get("productVariants", {}).get("edges", [])
+        if edges:
+            return edges[0]["node"].get("barcode")
+    except requests.exceptions.RequestException:
+        pass
     return None
 
 
