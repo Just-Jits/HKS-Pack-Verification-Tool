@@ -188,7 +188,7 @@
 </head>
 <body>
   <input type="text" id="scan-input" autofocus>
-  <div class="header">Scan an order barcode to begin</div>
+  <div class="header">Scan an order barcode to begin — logged in as {{ current_user }} (<a href="/logout" style="color:#888;">log out</a>)</div>
   <div id="visible-input-wrap">
     <input type="text" id="visible-input" placeholder="Or type order/product number here">
     <button id="new-order-btn" onclick="startNewOrder()" style="margin-left:10px; padding:10px 16px; background:#333; color:#fff; border-radius:8px;">🔄 New Order</button>
@@ -350,8 +350,29 @@
       const canMarkReady = allDone && !expressBlocked;
 
       let weightBannerHtml = "";
-      if (currentOrder.weight_warning) {
-        weightBannerHtml = `<div class="warn-banner">⚠️ ${currentOrder.weight_warning} (est. ${currentOrder.estimated_weight_kg}kg)</div>`;
+      if (currentOrder.checks?.ask_xs_satchel && !currentOrder.xs_satchel_confirmed) {
+        weightBannerHtml += `
+          <div class="warn-banner">
+            Does this weigh under 250g and fit into an XS Satchel?
+            <button onclick="confirmCheck('xs-satchel-ok')">Yes</button>
+            <button onclick="dismissCheck('xs')">No</button>
+          </div>`;
+      }
+      if (currentOrder.checks?.ask_express_upgrade && !currentOrder.express_confirmed_tag) {
+        weightBannerHtml += `
+          <div class="warn-banner">
+            Does this international parcel weigh over 2kg?
+            <button onclick="confirmCheck('confirmed-express')">Yes</button>
+            <button onclick="dismissCheck('exp')">No</button>
+          </div>`;
+      }
+      if (currentOrder.checks?.ask_split_shipment && !currentOrder.split_shipment_confirmed) {
+        weightBannerHtml += `
+          <div class="warn-banner">
+            Does this domestic parcel weigh over 5kg? If yes, split into 2 parcels.
+            <button onclick="confirmCheck('needs-split-shipment')">Yes</button>
+            <button onclick="dismissCheck('split')">No</button>
+          </div>`;
       }
 
       let expressBannerHtml = "";
@@ -383,6 +404,27 @@
           <div id="missing-area"></div>
         </div>
       `;
+    }
+
+    async function confirmCheck(tag) {
+      await fetch('/api/confirm_check', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({shop: currentOrder.shop, order_id: currentOrder.order_id, tag: tag})
+      });
+      if (tag === 'xs-satchel-ok') currentOrder.xs_satchel_confirmed = true;
+      if (tag === 'confirmed-express') currentOrder.express_confirmed_tag = true;
+      if (tag === 'needs-split-shipment') currentOrder.split_shipment_confirmed = true;
+      renderOrder();
+    }
+
+    function dismissCheck(which) {
+      // "No" just hides that question for this viewing — doesn't tag anything,
+      // since "no" means the default behaviour (small satchel / standard / single parcel) is correct
+      if (which === 'xs') currentOrder.checks.ask_xs_satchel = false;
+      if (which === 'exp') currentOrder.checks.ask_express_upgrade = false;
+      if (which === 'split') currentOrder.checks.ask_split_shipment = false;
+      renderOrder();
     }
 
     function confirmExpress() {

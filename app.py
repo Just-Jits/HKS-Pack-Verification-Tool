@@ -62,6 +62,61 @@ def log_error(context, detail):
         pass  # logging itself should never crash the app
 
 
+from datetime import timedelta
+from functools import wraps
+
+app.permanent_session_lifetime = timedelta(minutes=30)
+
+try:
+    PACK_USERS = json.loads(os.environ.get("PACK_TOOL_USERS_JSON", "{}"))
+except json.JSONDecodeError:
+    PACK_USERS = {}
+
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("logged_in_user"):
+            return redirect(f"/login?next={request.path}")
+        session.permanent = True  # refresh the 30-min sliding timeout on activity
+        return f(*args, **kwargs)
+    return wrapper
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        password = request.form.get("password", "")
+        if PACK_USERS.get(name) == password:
+            session.permanent = True
+            session["logged_in_user"] = name
+            return redirect(request.args.get("next", "/scan"))
+        error = "Wrong name or password"
+    return f"""
+    <html><body style="background:#111;color:#fff;font-family:sans-serif;
+    display:flex;align-items:center;justify-content:center;height:100vh;">
+    <form method="post" style="background:#1d1d1d;padding:30px;border-radius:12px;width:280px;">
+      <h2>📦 Pack Verify Login</h2>
+      {f'<p style="color:#ff6b6b;">{error}</p>' if error else ''}
+      <input name="name" placeholder="Name" style="width:100%;padding:10px;margin-bottom:10px;
+        background:#333;color:#fff;border:none;border-radius:6px;" autofocus>
+      <input name="password" type="password" placeholder="Password" style="width:100%;padding:10px;
+        margin-bottom:10px;background:#333;color:#fff;border:none;border-radius:6px;">
+      <button type="submit" style="width:100%;padding:10px;background:#2ecc71;color:#000;
+        border:none;border-radius:6px;font-weight:bold;">Log in</button>
+    </form>
+    </body></html>
+    """
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+
 # ---------- token storage ----------
 
 def load_tokens():
@@ -264,8 +319,9 @@ def home():
 
 
 @app.route("/scan")
+@login_required
 def scan():
-    return render_template("scan.html")
+    return render_template("scan.html", current_user=session.get("logged_in_user"))
 
 
 @app.route("/api/lookup_order")
@@ -297,13 +353,35 @@ def api_lookup_order():
         is_international = shipping_country not in ("AU", "")
         estimated_weight = estimate_order_weight(line_items)
         tags_raw = order.get("tags") or ""
-        needs_express_tag = "express-upgrade" in [t.strip().lower() for t in tags_raw.split(",")]
+        existing_tag_list = [t.strip().lower() for t in tags_raw.split(",")]
+        needs_express_tag = "express-upgrade" in existing_tag_list
 
-        weight_warning = None
-        if is_international and estimated_weight > 2:
-            weight_warning = "International parcel est. over 2kg — check if Express upgrade is needed"
-        elif not is_international and estimated_weight > 5:
-            weight_warning = "Domestic parcel est. over 5kg — check if it needs splitting into 2 satchels"
+        # small, single-item domestic orders that might qualify for the
+        # cheaper XS satchel — single distinct product, low total quantity,
+        # and a product type that's small/flat enough to physically fit
+        SMALL_ITEM_KEYWORDS = [
+            "rashguard", "rash guard", "shorts", "spats", "legging",
+            "hand wrap", "finger tape", "compression", "muay thai shorts",
+            "mma shorts", "lace converter", "mouthguard", "mouth guard",
+            "belt", "key chain", "keychain", "key ring", "keyring",
+            "air freshener",
+        ]
+        distinct_titles = set(li["title"].lower() for li in line_items)
+        total_qty = sum(li["quantity"] for li in line_items)
+        is_small_item_order = (
+            len(distinct_titles) == 1
+            and total_qty <= 1
+            and any(any(kw in t for kw in SMALL_ITEM_KEYWORDS) for t in distinct_titles)
+        )
+
+        checks = {
+            "ask_xs_satchel": (not is_international) and is_small_item_order and estimated_weight <= 0.25,
+            "ask_express_upgrade": is_international and estimated_weight > 2,
+            "ask_split_shipment": (not is_international) and estimated_weight > 5,
+        }
+        xs_satchel_confirmed = "xs-satchel-ok" in existing_tag_list
+        split_shipment_confirmed = "needs-split-shipment" in existing_tag_list
+        express_confirmed_tag = "confirmed-express" in existing_tag_list
 
         return jsonify({
             "shop": shop,
@@ -312,7 +390,10 @@ def api_lookup_order():
             "customer": shipping_address.get("name", ""),
             "is_international": is_international,
             "estimated_weight_kg": estimated_weight,
-            "weight_warning": weight_warning,
+            "checks": checks,
+            "xs_satchel_confirmed": xs_satchel_confirmed,
+            "split_shipment_confirmed": split_shipment_confirmed,
+            "express_confirmed_tag": express_confirmed_tag,
             "needs_express_tag": needs_express_tag,
             "line_items": line_items,
         })
@@ -321,7 +402,37 @@ def api_lookup_order():
         return jsonify({"error": f"Internal error looking up order — see /logs for detail"}), 500
 
 
+@app.route("/api/confirm_check", methods=["POST"])
+@login_required
+def api_confirm_check():
+    try:
+        body = request.get_json()
+        shop = body["shop"]
+        order_id = body["order_id"]
+        check_tag = body["tag"]  # e.g. "xs-satchel-ok", "confirmed-express", "needs-split-shipment"
+
+        current = shopify_get(shop, f"orders/{order_id}.json")
+        if not current:
+            return jsonify({"error": "Could not fetch order — see /logs", "ok": False}), 500
+
+        existing_tags = (current["order"].get("tags") or "")
+        tag_list = [t.strip() for t in existing_tags.split(",") if t.strip()]
+        if check_tag not in tag_list:
+            tag_list.append(check_tag)
+
+        payload = {"order": {"id": order_id, "tags": ", ".join(tag_list)}}
+        status_code, resp = shopify_put(shop, f"orders/{order_id}.json", payload)
+        if status_code not in (200, 201):
+            log_error("confirm_check", f"shop={shop} order_id={order_id} | {status_code}: {resp}")
+            return jsonify({"error": "failed to tag order", "ok": False}), 500
+        return jsonify({"ok": True})
+    except Exception as e:
+        log_error("confirm_check", str(e))
+        return jsonify({"error": str(e), "ok": False}), 500
+
+
 @app.route("/api/mark_order", methods=["POST"])
+@login_required
 def api_mark_order():
     try:
         body = request.get_json()
@@ -329,6 +440,7 @@ def api_mark_order():
         order_id = body["order_id"]
         status = body["status"]
         missing_items = body.get("missing_items", [])
+        packed_by = session.get("logged_in_user", "unknown")
 
         tag = "packed-ready" if status == "ready" else "packed-incomplete"
 
@@ -342,10 +454,10 @@ def api_mark_order():
         if tag not in tag_list:
             tag_list.append(tag)
 
-        note_addition = ""
+        note_addition = f"\n[Pack Verify] Packed by: {packed_by} ({status})"
         if status == "incomplete" and missing_items:
             names = ", ".join(i["title"] for i in missing_items)
-            note_addition = f"\n[Pack Verify] Missing at pack time: {names}"
+            note_addition += f" — Missing: {names}"
 
         payload = {
             "order": {
