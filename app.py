@@ -3,9 +3,11 @@ import json
 import time
 import hmac
 import hashlib
+import tempfile
 import requests
-from flask import Flask, request, redirect, render_template, jsonify, session
+from flask import Flask, request, redirect, render_template, jsonify, session, send_file
 from urllib.parse import urlencode
+from auspost_export import export_orders_to_xlsx
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-me-in-railway-env")
@@ -316,6 +318,101 @@ def find_order_by_number(order_number):
 def home():
     shops = all_connected_shops()
     return render_template("home.html", shops=shops, app_url=APP_URL)
+
+
+def fetch_packed_ready_orders(shop, single_order_id=None):
+    """Pulls full order data needed for the AusPost export — either every
+    packed-ready order not yet exported, or just one specific order."""
+    results = []
+    if single_order_id:
+        data = shopify_get(shop, f"orders/{single_order_id}.json")
+        raw_orders = [data["order"]] if data else []
+    else:
+        data = shopify_get(shop, "orders.json", params={
+            "status": "any", "tag": "packed-ready", "limit": 250,
+        })
+        raw_orders = data.get("orders", []) if data else []
+
+    for order in raw_orders:
+        tags = [t.strip().lower() for t in (order.get("tags") or "").split(",")]
+        if single_order_id is None and "auspost-exported" in tags:
+            continue
+
+        shipping_address = order.get("shipping_address") or {}
+        is_international = shipping_address.get("country_code", "AU") not in ("AU", "")
+
+        line_items = []
+        for li in order.get("line_items", []):
+            line_items.append({
+                "title": li["title"],
+                "quantity": li["quantity"],
+                "price": float(li.get("price", 0)),
+            })
+
+        results.append({
+            "order_id": order["id"],
+            "order_number": order["name"],
+            "shop": shop,
+            "shipping_address": shipping_address,
+            "is_international": is_international,
+            "line_items": line_items,
+            "tags": tags,
+        })
+    return results
+
+
+def mark_orders_exported(shop, order_ids):
+    for order_id in order_ids:
+        current = shopify_get(shop, f"orders/{order_id}.json")
+        if not current:
+            continue
+        existing_tags = [t.strip() for t in (current["order"].get("tags") or "").split(",") if t.strip()]
+        if "auspost-exported" not in existing_tags:
+            existing_tags.append("auspost-exported")
+            shopify_put(shop, f"orders/{order_id}.json", {
+                "order": {"id": order_id, "tags": ", ".join(existing_tags)}
+            })
+
+
+@app.route("/api/export_batch")
+@login_required
+def api_export_batch():
+    all_orders = []
+    for shop in all_connected_shops():
+        all_orders.extend(fetch_packed_ready_orders(shop))
+
+    if not all_orders:
+        return jsonify({"error": "No packed-ready orders found to export"}), 404
+
+    tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_export_{int(time.time())}.xlsx")
+    export_orders_to_xlsx(all_orders, tmp_path)
+
+    by_shop = {}
+    for o in all_orders:
+        by_shop.setdefault(o["shop"], []).append(o["order_id"])
+    for shop, order_ids in by_shop.items():
+        mark_orders_exported(shop, order_ids)
+
+    return send_file(tmp_path, as_attachment=True, download_name="auspost_export.xlsx")
+
+
+@app.route("/api/export_single")
+@login_required
+def api_export_single():
+    shop = request.args.get("shop")
+    order_id = request.args.get("order_id")
+    if not shop or not order_id:
+        return jsonify({"error": "missing shop or order_id"}), 400
+
+    orders = fetch_packed_ready_orders(shop, single_order_id=order_id)
+    if not orders:
+        return jsonify({"error": "Could not load that order"}), 404
+
+    tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_single_{order_id}_{int(time.time())}.xlsx")
+    export_orders_to_xlsx(orders, tmp_path)
+    mark_orders_exported(shop, [order_id])
+
+    return send_file(tmp_path, as_attachment=True, download_name=f"auspost_order_{orders[0]['order_number'].replace('#','')}.xlsx")
 
 
 @app.route("/scan")

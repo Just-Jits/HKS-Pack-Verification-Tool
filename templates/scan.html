@@ -500,8 +500,17 @@
         return;
       }
 
+      const shop = currentOrder.shop;
+      const orderId = currentOrder.order_id;
+      const orderNum = currentOrder.order_number;
       currentOrder = null;
       renderIdle();
+      content.innerHTML += `
+        <div style="max-width:700px;margin:16px auto;text-align:center;">
+          <a href="/api/export_single?shop=${encodeURIComponent(shop)}&order_id=${orderId}"
+             style="display:inline-block;background:#3498db;color:#fff;padding:10px 20px;
+             border-radius:8px;text-decoration:none;">📦 Export ${orderNum} to AusPost now</a>
+        </div>`;
     }
   </script>
 </body>
