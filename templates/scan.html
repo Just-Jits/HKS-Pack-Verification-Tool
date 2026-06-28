@@ -253,15 +253,24 @@
     }
 
     function handleScan(value) {
-      if (!value) return;
-
       if (!currentOrder) {
-        // treat as order number scan
+        if (!value) return;
         lookupOrder(value);
         return;
       }
 
-      // treat as product barcode scan against current order
+      const allDone = currentOrder.line_items.every(li => li.scanned_count >= li.quantity);
+      const expressBlocked = currentOrder.needs_express_tag && !currentOrder.express_confirmed;
+
+      if (!value && allDone && !expressBlocked) {
+        // empty Enter press while everything's already green — same as
+        // clicking "Mark Ready" manually, so the scanner hand never has to
+        // touch the mouse for a fully-clean order
+        completeOrder();
+        return;
+      }
+
+      if (!value) return;
       matchProduct(value);
     }
 
@@ -278,7 +287,10 @@
           return;
         }
         currentOrder = data;
-        currentOrder.line_items = currentOrder.line_items.map(li => ({...li, scanned_count: 0}));
+        currentOrder.line_items = currentOrder.line_items.map(li => ({
+          ...li,
+          scanned_count: li.auto_confirm ? li.quantity : 0
+        }));
         renderOrder();
       } catch (err) {
         content.innerHTML = `<div class="error-banner">Error: ${err.message || 'failed to reach server'}</div>`;

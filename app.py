@@ -335,17 +335,22 @@ def api_lookup_order():
         if not order:
             return jsonify({"error": f"Order #{order_number} not found in any connected store"}), 404
 
+        AUTO_CONFIRM_KEYWORDS = ["package protection", "free return", "free returns"]
+
         line_items = []
         for li in order["line_items"]:
             barcode = li.get("barcode")
             if not barcode:
                 barcode = lookup_live_barcode(shop, li.get("sku"))
+            title_lower = li["title"].lower()
+            auto_confirm = any(kw in title_lower for kw in AUTO_CONFIRM_KEYWORDS)
             line_items.append({
                 "id": li["id"],
                 "title": li["title"],
                 "sku": li.get("sku"),
                 "quantity": li["quantity"],
                 "barcode": barcode,
+                "auto_confirm": auto_confirm,
             })
 
         shipping_address = order.get("shipping_address") or {}
