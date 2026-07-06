@@ -357,6 +357,7 @@ def fetch_packed_ready_orders(shop, single_order_id=None):
             "is_international": is_international,
             "line_items": line_items,
             "tags": tags,
+            "email": order.get("email", ""),
         })
     return results
 

@@ -27,6 +27,17 @@ TOTAL_WEIGHT_KG = 0.2          # flat default per parcel, split evenly across bu
 VALUE_PCT = 0.80                # declared customs value = 80% of retail
 HS_FALLBACK = "611030"          # Rash Guard — used if a product matches no bucket
 
+# Flat default parcel dimensions in cm, applied to every row regardless of
+# packaging type (satchel or own packaging). AusPost started rejecting bulk
+# imports without these — adjust these three numbers if the real parcels run
+# bigger/smaller than a folded rashguard/gi in a satchel.
+ITEM_LENGTH_CM = 25
+ITEM_WIDTH_CM = 25
+ITEM_HEIGHT_CM = 5
+
+# What AusPost should do if a parcel can't be delivered.
+CANNOT_BE_DELIVERED = "RETURN_TO_SENDER"
+
 # Bucket name -> (keywords to match in product title, HS code for that bucket)
 BUCKETS = [
     ("Gi", ["gi", "kimono", "uniform"], "611430"),
@@ -140,7 +151,8 @@ def group_line_items(line_items):
 
 def build_row(order):
     """order is a dict with: order_number, shipping_address (dict), is_international,
-    line_items (list), tags (list, lowercased)."""
+    line_items (list), tags (list, lowercased), email (str — top-level order email,
+    NOT shipping_address email, since Shopify's shipping_address has no email field)."""
     addr = order.get("shipping_address") or {}
     tags = order.get("tags", [])
     is_intl = order["is_international"]
@@ -165,9 +177,10 @@ def build_row(order):
         addr.get("country_code", "AU") if is_intl else "AU",
         addr.get("address1", ""), addr.get("address2", ""), "",
         addr.get("city", ""), addr.get("province_code", "") if not is_intl else addr.get("province", ""),
-        addr.get("zip", ""), addr.get("phone", ""), "",
-        packaging, delivery_service, "Apparel", "", "", "",
-        TOTAL_WEIGHT_KG, "NO", "NO", "", "",
+        addr.get("zip", ""), addr.get("phone", ""), order.get("email", ""),
+        packaging, delivery_service, "Apparel",
+        ITEM_LENGTH_CM, ITEM_WIDTH_CM, ITEM_HEIGHT_CM,
+        TOTAL_WEIGHT_KG, "NO", "NO", "", CANNOT_BE_DELIVERED,
     ]
 
     if is_intl:
