@@ -66,10 +66,18 @@ HEADERS = [
     "Parcel 4 Contents - Value", "Parcel 4 Contents - Quantity",
     "Parcel 4 Contents - Country Of Origin", "Parcel 4 Contents - HS Tariff",
     "Send Tracking Notifications", "Send Tracking Email", "Additional Label Information 1",
-    "Delivery Instructions", "Comments", "Sender's Customs Reference",
+    "Delivery Instructions", "Comments", "Landed Costs Payer", "Sender's Customs Reference",
     "Importer's Reference Number", "Licence Numbers", "Certificate Numbers",
     "Invoice Numbers",
 ]
+
+# New AusPost field (added to their bulk import template, July 2026). Only
+# meaningful for international shipments — declares who pays any import
+# duties/taxes charged by the destination country. AusPost doesn't handle
+# these costs itself; it just needs the declaration.
+# Valid values: RECEIVER_PAYS, SENDER_PAYS_ZONOS, SENDER_PAYS_TAX_ID
+# (SENDER_PAYS_TAX_ID also requires "Importer's Reference Number" to be set.)
+LANDED_COSTS_PAYER = "RECEIVER_PAYS"
 
 
 def bucket_for(title):
@@ -178,7 +186,10 @@ def build_row(order):
         else:
             row += ["", "", "", "", "", ""]
 
-    row += ["NO", "", f"Order {order['order_number']}", "", "", "", "", "", "", ""]
+    landed_costs_payer = LANDED_COSTS_PAYER if is_intl else ""
+
+    row += ["NO", "", f"Order {order['order_number']}", "", "",
+            landed_costs_payer, "", "", "", "", ""]
 
     return row
 
