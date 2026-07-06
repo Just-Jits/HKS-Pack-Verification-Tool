@@ -8,7 +8,7 @@ generated .xlsx file.
 """
 
 import re
-from openpyxl import Workbook
+import csv
 
 SEND_FROM = {
     "name": "Just Jits",
@@ -36,7 +36,8 @@ ITEM_WIDTH_CM = 25
 ITEM_HEIGHT_CM = 5
 
 # What AusPost should do if a parcel can't be delivered.
-CANNOT_BE_DELIVERED = "RETURN_TO_SENDER"
+# AusPost only accepts: RETURN or ABANDONED
+CANNOT_BE_DELIVERED = "RETURN"
 
 # Bucket name -> (keywords to match in product title, HS code for that bucket)
 BUCKETS = [
@@ -152,14 +153,28 @@ def group_line_items(line_items):
 def build_row(order):
     """order is a dict with: order_number, shipping_address (dict), is_international,
     line_items (list), tags (list, lowercased), email (str — top-level order email,
-    NOT shipping_address email, since Shopify's shipping_address has no email field)."""
+    NOT shipping_address email, since Shopify's shipping_address has no email field),
+    shipping_line_title (str — the actual shipping method the customer selected and
+    paid for at checkout, e.g. 'Express Shipping' / 'International Express' — NOT
+    the same thing as the confirmed-express/express-upgrade tags below)."""
     addr = order.get("shipping_address") or {}
     tags = order.get("tags", [])
     is_intl = order["is_international"]
 
     bucket_rows = group_line_items(order["line_items"])
 
-    is_express = "confirmed-express" in tags or "express-upgrade" in tags
+    # Three separate ways an order can end up as Express, in priority order:
+    # 1. Customer actually selected and paid for an Express-named shipping
+    #    method at checkout (title varies by store — "Express Shipping",
+    #    "International Express", etc. — so this is a substring match, not
+    #    an exact one).
+    # 2. Staff manually confirmed an upgrade via the pack-screen weight
+    #    warning (confirmed-express tag).
+    # 3. Staff or CS manually flagged an order for upgrade another way
+    #    (express-upgrade tag).
+    shipping_line_title = (order.get("shipping_line_title") or "").lower()
+    customer_paid_express = "express" in shipping_line_title
+    is_express = customer_paid_express or "confirmed-express" in tags or "express-upgrade" in tags
     is_xs = (not is_intl) and ("xs-satchel-ok" in tags)
 
     if is_intl:
@@ -209,21 +224,23 @@ def build_row(order):
 
 def export_orders_to_xlsx(orders, output_path):
     """orders: list of order dicts (see build_row docstring for shape).
-    Handles split-shipment orders by emitting 2 rows for those specifically."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Orders"
-    ws.append(HEADERS)
+    Handles split-shipment orders by emitting 2 rows for those specifically.
 
-    for order in orders:
-        tags = order.get("tags", [])
-        needs_split = "needs-split-shipment" in tags
-        if needs_split:
-            # two identical-ish rows = two separate parcels/labels for this order
-            for _ in range(2):
-                ws.append(build_row(order))
-        else:
-            ws.append(build_row(order))
+    Despite the function name (kept for backwards compatibility with app.py's
+    existing calls), this now writes a real .csv file — AusPost's bulk upload
+    only accepts CSV, not .xlsx, so output_path should end in .csv."""
+    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(HEADERS)
 
-    wb.save(output_path)
+        for order in orders:
+            tags = order.get("tags", [])
+            needs_split = "needs-split-shipment" in tags
+            if needs_split:
+                # two identical-ish rows = two separate parcels/labels for this order
+                for _ in range(2):
+                    writer.writerow(build_row(order))
+            else:
+                writer.writerow(build_row(order))
+
     return output_path
