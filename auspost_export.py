@@ -205,7 +205,12 @@ def build_row(order):
     # than silently truncating and losing info like "Attention: Brigitte",
     # cut the business name to 40 chars for that field but keep the full
     # original text in Delivery Instructions so packers/couriers still see it.
-    raw_company = addr.get("company", "")
+    #
+    # NOTE: addr.get("company", "") is NOT enough on its own — Shopify's API
+    # returns "company": null explicitly when there's no company name (the
+    # key exists, its value is None), so .get()'s default never kicks in.
+    # The trailing "or ''" catches that None and turns it into a safe string.
+    raw_company = addr.get("company", "") or ""
     if len(raw_company) > 40:
         business_name = raw_company[:40]
         company_overflow_note = raw_company

@@ -347,7 +347,14 @@ def fetch_packed_ready_orders(shop, single_order_id=None):
             # still reflects the original order, current_quantity reflects
             # what's actually left after the edit. Without this, a removed
             # item still ends up on the customs declaration / weight calc.
+            # Explicitly check for None (Shopify sending current_quantity:
+            # null rather than omitting the key) rather than using "or",
+            # since a legitimate current_quantity of 0 is falsy too and
+            # "or" would wrongly fall back to the original quantity for
+            # exactly the removed-item case this is meant to catch.
             current_qty = li.get("current_quantity", li["quantity"])
+            if current_qty is None:
+                current_qty = li["quantity"]
             if current_qty == 0:
                 continue
             line_items.append({
@@ -452,7 +459,13 @@ def api_lookup_order():
             # alone still shows the ORIGINAL ordered amount even after an
             # item has been fully swapped out or removed, so filtering on
             # quantity would keep showing removed items as needing packing.
+            # Explicitly check for None rather than using "or" — a
+            # legitimate current_quantity of 0 (the removed-item case we're
+            # trying to catch) is falsy too, so "or" would wrongly undo the
+            # filter for exactly the case it's meant to handle.
             current_qty = li.get("current_quantity", li["quantity"])
+            if current_qty is None:
+                current_qty = li["quantity"]
             if current_qty == 0:
                 continue
             barcode = li.get("barcode")
