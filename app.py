@@ -343,11 +343,21 @@ def fetch_packed_ready_orders(shop, single_order_id=None):
 
         line_items = []
         for li in order.get("line_items", []):
+            # Skip items removed/swapped via a Shopify order edit — quantity
+            # still reflects the original order, current_quantity reflects
+            # what's actually left after the edit. Without this, a removed
+            # item still ends up on the customs declaration / weight calc.
+            current_qty = li.get("current_quantity", li["quantity"])
+            if current_qty == 0:
+                continue
             line_items.append({
                 "title": li["title"],
-                "quantity": li["quantity"],
+                "quantity": current_qty,
                 "price": float(li.get("price", 0)),
             })
+
+        shipping_lines = order.get("shipping_lines") or []
+        shipping_line_title = shipping_lines[0].get("title", "") if shipping_lines else ""
 
         results.append({
             "order_id": order["id"],
@@ -358,6 +368,7 @@ def fetch_packed_ready_orders(shop, single_order_id=None):
             "line_items": line_items,
             "tags": tags,
             "email": order.get("email", ""),
+            "shipping_line_title": shipping_line_title,
         })
     return results
 
@@ -385,7 +396,7 @@ def api_export_batch():
     if not all_orders:
         return jsonify({"error": "No packed-ready orders found to export"}), 404
 
-    tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_export_{int(time.time())}.xlsx")
+    tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_export_{int(time.time())}.csv")
     export_orders_to_xlsx(all_orders, tmp_path)
 
     by_shop = {}
@@ -394,7 +405,7 @@ def api_export_batch():
     for shop, order_ids in by_shop.items():
         mark_orders_exported(shop, order_ids)
 
-    return send_file(tmp_path, as_attachment=True, download_name="auspost_export.xlsx")
+    return send_file(tmp_path, as_attachment=True, download_name="auspost_export.csv", mimetype="text/csv")
 
 
 @app.route("/api/export_single")
@@ -409,11 +420,11 @@ def api_export_single():
     if not orders:
         return jsonify({"error": "Could not load that order"}), 404
 
-    tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_single_{order_id}_{int(time.time())}.xlsx")
+    tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_single_{order_id}_{int(time.time())}.csv")
     export_orders_to_xlsx(orders, tmp_path)
     mark_orders_exported(shop, [order_id])
 
-    return send_file(tmp_path, as_attachment=True, download_name=f"auspost_order_{orders[0]['order_number'].replace('#','')}.xlsx")
+    return send_file(tmp_path, as_attachment=True, download_name=f"auspost_order_{orders[0]['order_number'].replace('#','')}.csv", mimetype="text/csv")
 
 
 @app.route("/scan")
@@ -437,6 +448,13 @@ def api_lookup_order():
 
         line_items = []
         for li in order["line_items"]:
+            # current_quantity accounts for order edits/removals — quantity
+            # alone still shows the ORIGINAL ordered amount even after an
+            # item has been fully swapped out or removed, so filtering on
+            # quantity would keep showing removed items as needing packing.
+            current_qty = li.get("current_quantity", li["quantity"])
+            if current_qty == 0:
+                continue
             barcode = li.get("barcode")
             if not barcode:
                 barcode = lookup_live_barcode(shop, li.get("sku"))
@@ -446,7 +464,7 @@ def api_lookup_order():
                 "id": li["id"],
                 "title": li["title"],
                 "sku": li.get("sku"),
-                "quantity": li["quantity"],
+                "quantity": current_qty,
                 "barcode": barcode,
                 "auto_confirm": auto_confirm,
             })
