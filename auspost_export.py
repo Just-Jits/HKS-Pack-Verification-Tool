@@ -89,7 +89,24 @@ HEADERS = [
 # these costs itself; it just needs the declaration.
 # Valid values: RECEIVER_PAYS, SENDER_PAYS_ZONOS, SENDER_PAYS_TAX_ID
 # (SENDER_PAYS_TAX_ID also requires "Importer's Reference Number" to be set.)
-LANDED_COSTS_PAYER = "RECEIVER_PAYS"
+#
+# IMPORTANT: we deliberately leave this BLANK rather than sending an explicit
+# value. Per AusPost's policy (auspost.com.au/disruptions-and-updates/
+# international-service-updates/global-customs-imports): "If you do not
+# choose an option... it will automatically default to RECEIVER_PAYS for all
+# destinations, except for shipments [where the destination country has
+# mandated a different payer], [in which case] the appropriate option will
+# be automatically pre-selected." Real export errors have shown explicit
+# RECEIVER_PAYS gets rejected for the US and Spain specifically — and the
+# set of mandated-payer countries is tied to evolving international customs
+# rules (EU/Canada/Norway/UK changes are ongoing per the same policy page),
+# so hardcoding a country whitelist here would need constant upkeep and will
+# go stale. Leaving the field blank lets AusPost apply the correct default
+# per destination automatically, with zero risk of rejection either way.
+# On top of that, the two Sender-pays options aren't enabled for CSV bulk
+# lodgement until 16 July 2026, so there's no valid explicit override we
+# could send for the mandated-country cases even if we wanted to right now.
+LANDED_COSTS_PAYER = ""
 
 
 def bucket_for(title):
@@ -184,11 +201,23 @@ def build_row(order):
         packaging = "AP_SATCHEL_XS" if is_xs else "AP_SATCHEL_S"
         delivery_service = "EXP" if is_express else "PP"
 
+    # AusPost rejects "Deliver To Business Name" over 40 characters. Rather
+    # than silently truncating and losing info like "Attention: Brigitte",
+    # cut the business name to 40 chars for that field but keep the full
+    # original text in Delivery Instructions so packers/couriers still see it.
+    raw_company = addr.get("company", "")
+    if len(raw_company) > 40:
+        business_name = raw_company[:40]
+        company_overflow_note = raw_company
+    else:
+        business_name = raw_company
+        company_overflow_note = ""
+
     row = [
         SEND_FROM["name"], SEND_FROM["business_name"], SEND_FROM["address_line_1"],
         SEND_FROM["address_line_2"], SEND_FROM["address_line_3"], SEND_FROM["suburb"],
         SEND_FROM["state"], SEND_FROM["postcode"], SEND_FROM["phone"], SEND_FROM["email"],
-        addr.get("name", ""), "", addr.get("company", ""), "",
+        addr.get("name", ""), "", business_name, "",
         addr.get("country_code", "AU") if is_intl else "AU",
         addr.get("address1", ""), addr.get("address2", ""), "",
         addr.get("city", ""), addr.get("province_code", "") if not is_intl else addr.get("province", ""),
@@ -216,7 +245,9 @@ def build_row(order):
 
     landed_costs_payer = LANDED_COSTS_PAYER if is_intl else ""
 
-    row += ["NO", "", f"Order {order['order_number']}", "", "",
+    delivery_instructions = f"Business name (full): {company_overflow_note}" if company_overflow_note else ""
+
+    row += ["NO", "", f"Order {order['order_number']}", delivery_instructions, "",
             landed_costs_payer, "", "", "", "", ""]
 
     return row
