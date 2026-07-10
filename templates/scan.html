@@ -184,6 +184,43 @@
       font-size: 16px;
       width: 260px;
     }
+    /* Export bar — always visible regardless of scan state. Batch is the
+       primary action since most sessions end with a stack of orders, not
+       just one; single-order export is kept as a smaller secondary link
+       for one-offs. */
+    #export-bar {
+      max-width: 700px;
+      margin: 0 auto 20px auto;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: center;
+    }
+    #export-batch-btn {
+      flex: none;
+      background: #3498db;
+      color: #fff;
+      padding: 12px 22px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: bold;
+      font-size: 16px;
+      display: inline-block;
+    }
+    #export-batch-btn:hover { background: #2d82c0; }
+    #export-single-link {
+      flex: none;
+      color: #888;
+      font-size: 14px;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+    #export-single-link:hover { color: #aaa; }
+    #export-single-link.disabled {
+      color: #444;
+      cursor: not-allowed;
+      text-decoration: none;
+    }
   </style>
 </head>
 <body>
@@ -193,19 +230,21 @@
     <input type="text" id="visible-input" placeholder="Or type order/product number here">
     <button id="new-order-btn" onclick="startNewOrder()" style="margin-left:10px; padding:10px 16px; background:#333; color:#fff; border-radius:8px;">🔄 New Order</button>
   </div>
+  <div id="export-bar">
+    <a id="export-batch-btn" href="/api/export_batch">📦 Export Batch to AusPost</a>
+    <span id="export-single-link" class="disabled" onclick="exportCurrentSingle()">export just this order</span>
+  </div>
   <div id="content">
     <div class="idle">📦 Ready to scan</div>
   </div>
-
   <audio id="sound-ding" src="data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=" preload="auto"></audio>
-
   <script>
     const input = document.getElementById('scan-input');
     const content = document.getElementById('content');
     let currentOrder = null; // { shop, order_id, order_number, line_items: [{...,scanned_count}] }
+    let lastCompletedOrder = null; // { shop, order_id, order_number } — kept after marking ready, so the secondary single-order link stays usable
     let buffer = "";
     let bufferTimer = null;
-
     // keep focus on hidden input always, so scanner keystrokes land here —
     // but don't steal focus if the person is actively using the visible fallback field
     function refocus() {
@@ -217,7 +256,6 @@
     document.addEventListener('click', (e) => {
       if (e.target !== visibleInput) refocus();
     });
-
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
@@ -225,7 +263,6 @@
         input.value = "";
       }
     });
-
     const visibleInput = document.getElementById('visible-input');
     visibleInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
@@ -234,7 +271,6 @@
         visibleInput.value = "";
       }
     });
-
     function beep(type) {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       const osc = ctx.createOscillator();
@@ -246,22 +282,32 @@
       osc.start();
       osc.stop(ctx.currentTime + (type === 'good' ? 0.15 : 0.35));
     }
-
     function startNewOrder() {
       currentOrder = null;
       renderIdle();
     }
-
+    function updateExportSingleLink() {
+      const el = document.getElementById('export-single-link');
+      if (lastCompletedOrder) {
+        el.classList.remove('disabled');
+        el.textContent = `export just #${lastCompletedOrder.order_number} to AusPost`;
+      } else {
+        el.classList.add('disabled');
+        el.textContent = 'export just this order';
+      }
+    }
+    function exportCurrentSingle() {
+      if (!lastCompletedOrder) return;
+      window.location.href = `/api/export_single?shop=${encodeURIComponent(lastCompletedOrder.shop)}&order_id=${lastCompletedOrder.order_id}`;
+    }
     function handleScan(value) {
       if (!currentOrder) {
         if (!value) return;
         lookupOrder(value);
         return;
       }
-
       const allDone = currentOrder.line_items.every(li => li.scanned_count >= li.quantity);
       const expressBlocked = currentOrder.needs_express_tag && !currentOrder.express_confirmed;
-
       if (!value && allDone && !expressBlocked) {
         // empty Enter press while everything's already green — same as
         // clicking "Mark Ready" manually, so the scanner hand never has to
@@ -269,11 +315,9 @@
         completeOrder();
         return;
       }
-
       if (!value) return;
       matchProduct(value);
     }
-
     async function lookupOrder(orderNumber) {
       content.innerHTML = `<div class="idle">Looking up order ${orderNumber}...</div>`;
       try {
@@ -296,12 +340,10 @@
         content.innerHTML = `<div class="error-banner">Error: ${err.message || 'failed to reach server'}</div>`;
       }
     }
-
     function matchProduct(barcode) {
       const items = currentOrder.line_items;
       // find an item with this barcode (or sku as fallback) that isn't fully scanned yet
       let match = items.find(li => (li.barcode === barcode || li.sku === barcode) && li.scanned_count < li.quantity);
-
       if (!match) {
         // check if it's a valid item but already fully scanned (over-scan)
         let overscan = items.find(li => li.barcode === barcode || li.sku === barcode);
@@ -310,20 +352,16 @@
         renderOrder(overscan ? `Already scanned all of: ${overscan.title}` : `Not in this order: ${barcode}`);
         return;
       }
-
       match.scanned_count += 1;
       beep('good');
       renderOrder();
     }
-
     function flashOrderRed() {
       // visual handled via re-render message; could enhance with full-screen flash
     }
-
     function renderIdle() {
       content.innerHTML = `<div class="idle">📦 Ready to scan</div>`;
     }
-
     function resetItem(idx) {
       const li = currentOrder.line_items[idx];
       if (li.scanned_count > 0) {
@@ -331,14 +369,12 @@
       }
       renderOrder();
     }
-
     function manualConfirm(idx) {
       const li = currentOrder.line_items[idx];
       li.scanned_count = Math.min(li.scanned_count + 1, li.quantity);
       beep('good');
       renderOrder();
     }
-
     function renderOrder(message) {
       const items = currentOrder.line_items.map((li, idx) => {
         const complete = li.scanned_count >= li.quantity;
@@ -356,11 +392,9 @@
           </div>
         `;
       }).join("");
-
       const allDone = currentOrder.line_items.every(li => li.scanned_count >= li.quantity);
       const expressBlocked = currentOrder.needs_express_tag && !currentOrder.express_confirmed;
       const canMarkReady = allDone && !expressBlocked;
-
       let weightBannerHtml = "";
       if (currentOrder.checks?.ask_xs_satchel && !currentOrder.xs_satchel_confirmed) {
         weightBannerHtml += `
@@ -386,7 +420,6 @@
             <button onclick="dismissCheck('split')">No</button>
           </div>`;
       }
-
       let expressBannerHtml = "";
       if (currentOrder.needs_express_tag) {
         if (currentOrder.express_confirmed) {
@@ -400,7 +433,6 @@
           `;
         }
       }
-
       content.innerHTML = `
         <div class="order-card">
           <div class="order-title">Order ${currentOrder.order_number}</div>
@@ -417,7 +449,6 @@
         </div>
       `;
     }
-
     async function confirmCheck(tag) {
       await fetch('/api/confirm_check', {
         method: 'POST',
@@ -429,7 +460,6 @@
       if (tag === 'needs-split-shipment') currentOrder.split_shipment_confirmed = true;
       renderOrder();
     }
-
     function dismissCheck(which) {
       // "No" just hides that question for this viewing — doesn't tag anything,
       // since "no" means the default behaviour (small satchel / standard / single parcel) is correct
@@ -438,12 +468,10 @@
       if (which === 'split') currentOrder.checks.ask_split_shipment = false;
       renderOrder();
     }
-
     function confirmExpress() {
       currentOrder.express_confirmed = true;
       renderOrder();
     }
-
     function showMissingPicker() {
       const area = document.getElementById('missing-area');
       const options = currentOrder.line_items.map((li, idx) => `
@@ -459,11 +487,9 @@
         </div>
       `;
     }
-
     async function submitIncomplete() {
       const checked = Array.from(document.querySelectorAll('.missing-picker input:checked'));
       const missing = checked.map(c => currentOrder.line_items[parseInt(c.value)]);
-
       const res = await fetch('/api/mark_order', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -479,11 +505,9 @@
         alert('Failed to tag order as incomplete: ' + JSON.stringify(data.detail || data.error));
         return;
       }
-
       currentOrder = null;
       renderIdle();
     }
-
     async function completeOrder() {
       const res = await fetch('/api/mark_order', {
         method: 'POST',
@@ -499,18 +523,17 @@
         alert('Failed to mark order ready: ' + JSON.stringify(data.detail || data.error));
         return;
       }
-
-      const shop = currentOrder.shop;
-      const orderId = currentOrder.order_id;
-      const orderNum = currentOrder.order_number;
+      // Keep a reference to the just-completed order so the secondary
+      // "export just this order" link stays usable after the screen resets —
+      // the primary path is Export Batch, up in the persistent export bar.
+      lastCompletedOrder = {
+        shop: currentOrder.shop,
+        order_id: currentOrder.order_id,
+        order_number: currentOrder.order_number,
+      };
+      updateExportSingleLink();
       currentOrder = null;
       renderIdle();
-      content.innerHTML += `
-        <div style="max-width:700px;margin:16px auto;text-align:center;">
-          <a href="/api/export_single?shop=${encodeURIComponent(shop)}&order_id=${orderId}"
-             style="display:inline-block;background:#3498db;color:#fff;padding:10px 20px;
-             border-radius:8px;text-decoration:none;">📦 Export ${orderNum} to AusPost now</a>
-        </div>`;
     }
   </script>
 </body>
