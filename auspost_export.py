@@ -19,8 +19,8 @@ SEND_FROM = {
     "suburb": "Vermont",
     "state": "VIC",
     "postcode": "3133",
-    "phone": "",  # fill in if you want this on every row
-    "email": "",
+    "phone": "0422695001",
+    "email": "info@justjits.com",
 }
 
 TOTAL_WEIGHT_KG = 0.2          # flat default per parcel, single combined customs line
@@ -283,7 +283,7 @@ def build_row(order):
 
     delivery_instructions = f"Business name (full): {company_overflow_note}" if company_overflow_note else ""
 
-    row += ["NO", "", f"Order {order['order_number']}", delivery_instructions, "",
+    row += ["YES", "", f"Order {order['order_number']}", delivery_instructions, "",
             landed_costs_payer, "", "", "", "", ""]
 
     return row
