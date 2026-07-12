@@ -257,6 +257,53 @@ def estimate_item_weight(title):
     return DEFAULT_ITEM_WEIGHT_KG
 
 
+# Dedicated, more precise weight table just for the XS-satchel check below.
+# Deliberately separate from WEIGHT_TABLE above — that one is a coarse
+# shipping-weight estimate used for the Express/split-shipment checks, which
+# can tolerate rough numbers. This one needs an actual garment-weight cutoff,
+# since it's specifically deciding "does this fit under 250g".
+#
+# Only the per-unit weight is stored — max quantity under 250g is COMPUTED
+# from it (250 // weight_g), not hand-typed. Hand-typing it previously led to
+# every category being capped at 1 "to be safe", even featherweight items
+# like key chains (20g, actually fits 12) and mouthguards (30g, fits 8) —
+# computing it removes that whole class of silently-wrong number.
+XS_SATCHEL_LIMIT_G = 250
+XS_SATCHEL_KIDS_KEYWORDS = ["kids", "kid ", "youth"]
+XS_SATCHEL_KIDS_ITEM_KEYWORDS = ["rashguard", "rash guard", "shorts", "spats",
+                                  "legging", "compression"]
+# (keywords, weight_grams) — checked in order, first match wins
+XS_SATCHEL_ITEM_TABLE = [
+    (["finger tape"], 120),
+    (["rashguard", "rash guard", "shorts", "spats", "legging", "compression",
+      "muay thai shorts", "mma shorts"], 180),
+    (["belt"], 180),
+    (["hand wrap"], 80),
+    (["mouthguard", "mouth guard"], 30),
+    (["lace converter"], 20),
+    (["key chain", "keychain", "key ring", "keyring"], 20),
+    (["air freshener"], 30),
+]
+
+
+def xs_satchel_item_lookup(title):
+    """Returns (weight_grams, max_qty_under_250g) for a product title, or
+    None if it doesn't match any XS-satchel-eligible category at all.
+    max_qty is always computed from weight, never hand-typed."""
+    title_lower = title.lower()
+    # Kids'/youth rash guards & shorts are noticeably lighter than adult —
+    # check this first so "Kids Rash Guard" doesn't fall through to the
+    # heavier generic "rash guard" entry below.
+    is_kids = any(kw in title_lower for kw in XS_SATCHEL_KIDS_KEYWORDS)
+    if is_kids and any(kw in title_lower for kw in XS_SATCHEL_KIDS_ITEM_KEYWORDS):
+        weight_g = 120
+        return (weight_g, XS_SATCHEL_LIMIT_G // weight_g)
+    for keywords, weight_g in XS_SATCHEL_ITEM_TABLE:
+        if any(kw in title_lower for kw in keywords):
+            return (weight_g, XS_SATCHEL_LIMIT_G // weight_g)
+    return None
+
+
 def estimate_order_weight(line_items):
     total = 0.0
     for li in line_items:
@@ -490,26 +537,33 @@ def api_lookup_order():
         existing_tag_list = [t.strip().lower() for t in tags_raw.split(",")]
         needs_express_tag = "express-upgrade" in existing_tag_list
 
-        # small, single-item domestic orders that might qualify for the
-        # cheaper XS satchel — single distinct product, low total quantity,
-        # and a product type that's small/flat enough to physically fit
-        SMALL_ITEM_KEYWORDS = [
-            "rashguard", "rash guard", "shorts", "spats", "legging",
-            "hand wrap", "finger tape", "compression", "muay thai shorts",
-            "mma shorts", "lace converter", "mouthguard", "mouth guard",
-            "belt", "key chain", "keychain", "key ring", "keyring",
-            "air freshener",
-        ]
+        # small, single-product-type domestic orders that might qualify for
+        # the cheaper XS satchel. Quantity allowed depends on actual item
+        # weight — e.g. 2 kids' rashguards or 2 finger tape rolls can still
+        # land under 250g together, even though a single adult rashguard
+        # already exceeds it alone. See xs_satchel_item_lookup() above.
         distinct_titles = set(li["title"].lower() for li in line_items)
         total_qty = sum(li["quantity"] for li in line_items)
-        is_small_item_order = (
-            len(distinct_titles) == 1
-            and total_qty <= 1
-            and any(any(kw in t for kw in SMALL_ITEM_KEYWORDS) for t in distinct_titles)
-        )
+        is_small_item_order = False
+        if len(distinct_titles) == 1:
+            only_title = next(iter(distinct_titles))
+            lookup = xs_satchel_item_lookup(only_title)
+            if lookup:
+                _weight_g, max_qty = lookup
+                is_small_item_order = total_qty <= max_qty
 
         checks = {
-            "ask_xs_satchel": (not is_international) and is_small_item_order and estimated_weight <= 0.25,
+            # BUG FIX: this used to also require estimated_weight <= 0.25,
+            # but the weight-estimate table rates a single rashguard or pair
+            # of shorts at 0.3kg — ABOVE that 0.25 threshold — so the check
+            # could never fire for the exact two product types it exists to
+            # catch. It's been mathematically unreachable since it was built.
+            # Dropping that gate: is_small_item_order already restricts this
+            # to a single qualifying product, and the whole point of the
+            # banner is to ask the packer to physically verify the actual
+            # weight — pre-filtering on a rough, already-known-inaccurate
+            # estimate defeats that purpose.
+            "ask_xs_satchel": (not is_international) and is_small_item_order,
             "ask_express_upgrade": is_international and estimated_weight > 2,
             "ask_split_shipment": (not is_international) and estimated_weight > 5,
         }

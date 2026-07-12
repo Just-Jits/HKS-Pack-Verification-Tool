@@ -23,17 +23,30 @@ SEND_FROM = {
     "email": "",
 }
 
-TOTAL_WEIGHT_KG = 0.2          # flat default per parcel, split evenly across buckets
-VALUE_PCT = 0.80                # declared customs value = 80% of retail
+TOTAL_WEIGHT_KG = 0.2          # flat default per parcel, single combined customs line
+VALUE_PCT = 0.10                # declared customs value = 10% of retail (a 90% reduction)
 HS_FALLBACK = "611030"          # Rash Guard — used if a product matches no bucket
 
-# Flat default parcel dimensions in cm, applied to every row regardless of
-# packaging type (satchel or own packaging). AusPost started rejecting bulk
-# imports without these — adjust these three numbers if the real parcels run
-# bigger/smaller than a folded rashguard/gi in a satchel.
-ITEM_LENGTH_CM = 25
-ITEM_WIDTH_CM = 25
-ITEM_HEIGHT_CM = 5
+# Three separate dimension profiles now, not one flat default for everyone:
+#
+# 1. Domestic default (small/XS satchel) — every domestic order unless the
+#    single-item override below applies.
+DOMESTIC_SATCHEL_LENGTH_CM = 30
+DOMESTIC_SATCHEL_WIDTH_CM = 10
+DOMESTIC_SATCHEL_HEIGHT_CM = 5
+#
+# 2. Domestic, confirmed single tiny item (xs-satchel-ok tag) — switches
+#    packaging to Own Packaging with these smaller dimensions instead of
+#    the AusPost satchel product.
+DOMESTIC_XS_OWN_LENGTH_CM = 20
+DOMESTIC_XS_OWN_WIDTH_CM = 20
+DOMESTIC_XS_OWN_HEIGHT_CM = 2
+#
+# 3. International — always Own Packaging. Left unchanged from the original
+#    flat default (not part of the domestic dimension rework).
+INTL_LENGTH_CM = 25
+INTL_WIDTH_CM = 25
+INTL_HEIGHT_CM = 5
 
 # What AusPost should do if a parcel can't be delivered.
 # AusPost only accepts: RETURN or ABANDONED
@@ -119,16 +132,34 @@ def bucket_for(title):
 
 
 def round_to_90_cents(value):
-    """Round to the nearest dollar, then force the cents to .90 — matches the
-    '80%, ending in .90' rule Ganesh asked for."""
+    """Round down to the nearest dollar, then force the cents to .90 — matches
+    the '10% of retail, ending in .90' rule Ganesh asked for."""
     whole = int(value)
     return whole + 0.90
 
 
 def group_line_items(line_items):
-    """Groups raw Shopify line items into up to 4 customs-declaration buckets,
-    combining identical product types (e.g. 4 rashguards -> one line, qty 4)
-    rather than one line per unit."""
+    """Combines ALL line items in the order into a SINGLE customs-declaration
+    line — one description, one HS code, quantity always 1, one combined
+    value — rather than a separate line per product category.
+
+    Splitting into multiple customs lines was the root cause of the
+    over-declared-value issue: when entering these by hand, each of the
+    (up to 4) lines was getting the full order value repeatedly instead of
+    each getting its own share, multiplying the effective declared value.
+    One combined line removes that failure mode entirely.
+
+    Quantity is hardcoded to 1 regardless of how many physical units are in
+    the parcel — this declares "one item" for customs purposes, per Ganesh's
+    explicit instruction, not a literal per-unit count.
+
+    The representative description/HS code is taken from whichever product
+    category has the highest total retail value in the order (so a "3
+    rashguards + 1 gi" order gets classified/described by the gi if the gi
+    is worth more, even though rashguards outnumber it) — this is a
+    simplification for a single-line declaration, not a precise per-item
+    customs breakdown.
+    """
     groups = {}  # bucket_name -> {qty, total_retail_value, hs_code}
     for li in line_items:
         bucket_name, hs_code = bucket_for(li["title"])
@@ -137,34 +168,24 @@ def group_line_items(line_items):
         groups[bucket_name]["qty"] += li["quantity"]
         groups[bucket_name]["value"] += li.get("price", 0) * li["quantity"]
 
-    bucket_list = list(groups.items())
-    if len(bucket_list) > 4:
-        # Combine the smallest-value extras into the last bucket that fits,
-        # rather than silently dropping data or guessing — flagged via the
-        # 'NEEDS REVIEW' description so it's obviously not a normal row.
-        bucket_list.sort(key=lambda x: x[1]["value"])
-        overflow = bucket_list[:-4]
-        kept = bucket_list[-4:]
-        extra_qty = sum(b[1]["qty"] for b in overflow)
-        extra_value = sum(b[1]["value"] for b in overflow)
-        kept[0][1]["qty"] += extra_qty
-        kept[0][1]["value"] += extra_value
-        bucket_list = kept
+    if not groups:
+        return []
 
-    weight_per_bucket = round(TOTAL_WEIGHT_KG / max(len(bucket_list), 1), 3)
+    total_retail_value = sum(g["value"] for g in groups.values())
 
-    rows = []
-    for bucket_name, data in bucket_list:
-        declared_value = round_to_90_cents(data["value"] * VALUE_PCT)
-        rows.append({
-            "description": bucket_name[:40],
-            "weight": weight_per_bucket,
-            "value": declared_value,
-            "quantity": data["qty"],
-            "country_of_origin": "AU",
-            "hs_tariff": data["hs_code"],
-        })
-    return rows
+    # Pick the highest-value category as the representative description/HS code
+    dominant_bucket_name, dominant = max(groups.items(), key=lambda kv: kv[1]["value"])
+
+    declared_value = round_to_90_cents(total_retail_value * VALUE_PCT)
+
+    return [{
+        "description": dominant_bucket_name[:40],
+        "weight": TOTAL_WEIGHT_KG,
+        "value": declared_value,
+        "quantity": 1,
+        "country_of_origin": "AU",
+        "hs_tariff": dominant["hs_code"],
+    }]
 
 
 def build_row(order):
@@ -197,9 +218,19 @@ def build_row(order):
     if is_intl:
         packaging = "OWN_PACKAGING"
         delivery_service = "EXP" if is_express else "STD"
-    else:
-        packaging = "AP_SATCHEL_XS" if is_xs else "AP_SATCHEL_S"
+        item_length, item_width, item_height = INTL_LENGTH_CM, INTL_WIDTH_CM, INTL_HEIGHT_CM
+    elif is_xs:
+        # Packer confirmed this is a single item under 250g that fits a tiny
+        # satchel — switch off the AusPost satchel product entirely and use
+        # Own Packaging at the smaller confirmed dimensions.
+        packaging = "OWN_PACKAGING"
         delivery_service = "EXP" if is_express else "PP"
+        item_length, item_width, item_height = DOMESTIC_XS_OWN_LENGTH_CM, DOMESTIC_XS_OWN_WIDTH_CM, DOMESTIC_XS_OWN_HEIGHT_CM
+    else:
+        # Domestic default — AusPost Small satchel at the standard dimensions.
+        packaging = "AP_SATCHEL_S"
+        delivery_service = "EXP" if is_express else "PP"
+        item_length, item_width, item_height = DOMESTIC_SATCHEL_LENGTH_CM, DOMESTIC_SATCHEL_WIDTH_CM, DOMESTIC_SATCHEL_HEIGHT_CM
 
     # AusPost rejects "Deliver To Business Name" over 40 characters. Rather
     # than silently truncating and losing info like "Attention: Brigitte",
@@ -228,7 +259,7 @@ def build_row(order):
         addr.get("city", ""), addr.get("province_code", "") if not is_intl else addr.get("province", ""),
         addr.get("zip", ""), addr.get("phone", ""), order.get("email", ""),
         packaging, delivery_service, "Apparel",
-        ITEM_LENGTH_CM, ITEM_WIDTH_CM, ITEM_HEIGHT_CM,
+        item_length, item_width, item_height,
         TOTAL_WEIGHT_KG, "NO", "NO", "", CANNOT_BE_DELIVERED,
     ]
 
