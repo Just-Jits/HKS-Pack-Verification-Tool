@@ -367,6 +367,53 @@ def home():
     return render_template("home.html", shops=shops, app_url=APP_URL)
 
 
+def process_order_for_export(shop, order):
+    """Converts one raw Shopify order dict into the format the AusPost
+    export needs. Pulled out as its own function so both the normal
+    packed-ready flow and the re-export-by-exception flow can share it
+    rather than duplicating this logic."""
+    shipping_address = order.get("shipping_address") or {}
+    is_international = shipping_address.get("country_code", "AU") not in ("AU", "")
+    tags = [t.strip().lower() for t in (order.get("tags") or "").split(",")]
+
+    line_items = []
+    for li in order.get("line_items", []):
+        # Skip items removed/swapped via a Shopify order edit — quantity
+        # still reflects the original order, current_quantity reflects
+        # what's actually left after the edit. Without this, a removed
+        # item still ends up on the customs declaration / weight calc.
+        # Explicitly check for None (Shopify sending current_quantity:
+        # null rather than omitting the key) rather than using "or",
+        # since a legitimate current_quantity of 0 is falsy too and
+        # "or" would wrongly fall back to the original quantity for
+        # exactly the removed-item case this is meant to catch.
+        current_qty = li.get("current_quantity", li["quantity"])
+        if current_qty is None:
+            current_qty = li["quantity"]
+        if current_qty == 0:
+            continue
+        line_items.append({
+            "title": li["title"],
+            "quantity": current_qty,
+            "price": float(li.get("price", 0)),
+        })
+
+    shipping_lines = order.get("shipping_lines") or []
+    shipping_line_title = shipping_lines[0].get("title", "") if shipping_lines else ""
+
+    return {
+        "order_id": order["id"],
+        "order_number": order["name"],
+        "shop": shop,
+        "shipping_address": shipping_address,
+        "is_international": is_international,
+        "line_items": line_items,
+        "tags": tags,
+        "email": order.get("email", ""),
+        "shipping_line_title": shipping_line_title,
+    }
+
+
 def fetch_packed_ready_orders(shop, single_order_id=None):
     """Pulls full order data needed for the AusPost export — either every
     packed-ready order not yet exported, or just one specific order."""
@@ -384,47 +431,35 @@ def fetch_packed_ready_orders(shop, single_order_id=None):
         tags = [t.strip().lower() for t in (order.get("tags") or "").split(",")]
         if single_order_id is None and "auspost-exported" in tags:
             continue
-
-        shipping_address = order.get("shipping_address") or {}
-        is_international = shipping_address.get("country_code", "AU") not in ("AU", "")
-
-        line_items = []
-        for li in order.get("line_items", []):
-            # Skip items removed/swapped via a Shopify order edit — quantity
-            # still reflects the original order, current_quantity reflects
-            # what's actually left after the edit. Without this, a removed
-            # item still ends up on the customs declaration / weight calc.
-            # Explicitly check for None (Shopify sending current_quantity:
-            # null rather than omitting the key) rather than using "or",
-            # since a legitimate current_quantity of 0 is falsy too and
-            # "or" would wrongly fall back to the original quantity for
-            # exactly the removed-item case this is meant to catch.
-            current_qty = li.get("current_quantity", li["quantity"])
-            if current_qty is None:
-                current_qty = li["quantity"]
-            if current_qty == 0:
-                continue
-            line_items.append({
-                "title": li["title"],
-                "quantity": current_qty,
-                "price": float(li.get("price", 0)),
-            })
-
-        shipping_lines = order.get("shipping_lines") or []
-        shipping_line_title = shipping_lines[0].get("title", "") if shipping_lines else ""
-
-        results.append({
-            "order_id": order["id"],
-            "order_number": order["name"],
-            "shop": shop,
-            "shipping_address": shipping_address,
-            "is_international": is_international,
-            "line_items": line_items,
-            "tags": tags,
-            "email": order.get("email", ""),
-            "shipping_line_title": shipping_line_title,
-        })
+        results.append(process_order_for_export(shop, order))
     return results
+
+
+def find_order_by_number_any_status(order_number):
+    """Like find_order_by_number, but doesn't care whether the order is
+    packed-ready or already auspost-exported — used for re-export by
+    exception, where the order has usually already been exported once
+    (that's the whole reason it needs re-exporting)."""
+    for shop in all_connected_shops():
+        data = shopify_get(shop, "orders.json", params={"name": f"#{order_number}", "status": "any"})
+        if data and data.get("orders"):
+            return shop, data["orders"][0]
+    return None, None
+
+
+def unmark_order_exported(shop, order_id):
+    """Removes the auspost-exported tag from one order, if present. Opposite
+    of mark_orders_exported — used so a re-exported order doesn't keep its
+    stale 'already exported' tag pointing at the broken CSV it was on before."""
+    current = shopify_get(shop, f"orders/{order_id}.json")
+    if not current:
+        return
+    existing_tags = [t.strip() for t in (current["order"].get("tags") or "").split(",") if t.strip()]
+    if any(t.lower() == "auspost-exported" for t in existing_tags):
+        existing_tags = [t for t in existing_tags if t.lower() != "auspost-exported"]
+        shopify_put(shop, f"orders/{order_id}.json", {
+            "order": {"id": order_id, "tags": ", ".join(existing_tags)}
+        })
 
 
 def mark_orders_exported(shop, order_ids):
@@ -438,6 +473,40 @@ def mark_orders_exported(shop, order_ids):
             shopify_put(shop, f"orders/{order_id}.json", {
                 "order": {"id": order_id, "tags": ", ".join(existing_tags)}
             })
+
+
+# Tracks which orders were included in the most recent /api/export_batch run,
+# so "re-export last batch" can redo exactly that set without anyone needing
+# to type out order numbers by hand. Written to a temp file rather than kept
+# in memory, so it survives across requests even if Railway runs multiple
+# workers or restarts the process between the export and the re-export.
+LAST_BATCH_EXPORT_PATH = os.path.join(tempfile.gettempdir(), "last_batch_export.json")
+
+
+def save_last_batch_export(orders):
+    """orders: the same list of dicts fetch_packed_ready_orders returns —
+    just need shop/order_id/order_number out of each."""
+    record = {
+        "exported_at": time.time(),
+        "orders": [
+            {"shop": o["shop"], "order_id": o["order_id"], "order_number": o["order_number"]}
+            for o in orders
+        ],
+    }
+    with open(LAST_BATCH_EXPORT_PATH, "w") as f:
+        json.dump(record, f)
+
+
+def load_last_batch_export():
+    """Returns the saved record, or None if no batch has been exported yet
+    (or the temp file got cleared, e.g. by a Railway restart)."""
+    if not os.path.exists(LAST_BATCH_EXPORT_PATH):
+        return None
+    try:
+        with open(LAST_BATCH_EXPORT_PATH) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 @app.route("/api/export_batch")
@@ -459,6 +528,8 @@ def api_export_batch():
     for shop, order_ids in by_shop.items():
         mark_orders_exported(shop, order_ids)
 
+    save_last_batch_export(all_orders)
+
     return send_file(tmp_path, as_attachment=True, download_name="auspost_export.csv", mimetype="text/csv")
 
 
@@ -479,6 +550,107 @@ def api_export_single():
     mark_orders_exported(shop, [order_id])
 
     return send_file(tmp_path, as_attachment=True, download_name=f"auspost_order_{orders[0]['order_number'].replace('#','')}.csv", mimetype="text/csv")
+
+
+@app.route("/api/reexport_orders")
+@login_required
+def api_reexport_orders():
+    """Re-export specific orders BY EXCEPTION — e.g. a handful of orders
+    that errored on the AusPost side and need fixed data resent. Unlike
+    /api/export_batch, this does NOT touch every packed-ready order — only
+    the exact order numbers passed in. For each one: strips its stale
+    'auspost-exported' tag (if present), regenerates its row with whatever
+    the current code produces, bundles them into one CSV, then re-tags them
+    exported again afterward.
+
+    Usage: /api/reexport_orders?orders=16341,16342,3812
+    (accepts '#' prefixes too, e.g. #16341 — they're stripped automatically)
+    """
+    raw = request.args.get("orders", "").strip()
+    if not raw:
+        return jsonify({"error": "no order numbers provided — use ?orders=16341,16342,..."}), 400
+
+    order_numbers = [o.strip().lstrip("#") for o in raw.split(",") if o.strip()]
+    if not order_numbers:
+        return jsonify({"error": "no valid order numbers found in that list"}), 400
+
+    all_orders = []
+    not_found = []
+    for order_number in order_numbers:
+        shop, order = find_order_by_number_any_status(order_number)
+        if not order:
+            not_found.append(order_number)
+            continue
+        unmark_order_exported(shop, order["id"])
+        all_orders.append(process_order_for_export(shop, order))
+
+    if not all_orders:
+        return jsonify({"error": "none of the given order numbers were found in any connected store",
+                         "not_found": not_found}), 404
+
+    tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_reexport_{int(time.time())}.csv")
+    export_orders_to_xlsx(all_orders, tmp_path)
+
+    by_shop = {}
+    for o in all_orders:
+        by_shop.setdefault(o["shop"], []).append(o["order_id"])
+    for shop, order_ids in by_shop.items():
+        mark_orders_exported(shop, order_ids)
+
+    response = send_file(tmp_path, as_attachment=True, download_name="auspost_reexport.csv", mimetype="text/csv")
+    if not_found:
+        # Surfaced as a response header rather than failing the whole
+        # request — the orders that WERE found still export successfully,
+        # and the front-end can read this header to warn about the rest.
+        response.headers["X-Not-Found-Orders"] = ",".join(not_found)
+    return response
+
+
+@app.route("/api/reexport_last_batch")
+@login_required
+def api_reexport_last_batch():
+    """Re-exports exactly the same set of orders that the most recent
+    /api/export_batch run sent — no need to type out order numbers by hand
+    when a whole batch needs redoing (e.g. it went out with errors and got
+    fixed since). Reuses the same strip-tag / regenerate / re-tag flow as
+    /api/reexport_orders, just sourced from the saved last-batch record
+    instead of a typed-in list."""
+    record = load_last_batch_export()
+    if not record or not record.get("orders"):
+        return jsonify({"error": "No previous batch export found to redo. "
+                                  "This resets if the server restarts, or if "
+                                  "no batch export has been run yet this session."}), 404
+
+    all_orders = []
+    not_found = []
+    for entry in record["orders"]:
+        shop, order_id = entry["shop"], entry["order_id"]
+        data = shopify_get(shop, f"orders/{order_id}.json")
+        if not data or not data.get("order"):
+            not_found.append(entry.get("order_number", str(order_id)))
+            continue
+        unmark_order_exported(shop, order_id)
+        all_orders.append(process_order_for_export(shop, data["order"]))
+
+    if not all_orders:
+        return jsonify({"error": "None of the orders from the last batch could be found anymore",
+                         "not_found": not_found}), 404
+
+    tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_reexport_last_batch_{int(time.time())}.csv")
+    export_orders_to_xlsx(all_orders, tmp_path)
+
+    by_shop = {}
+    for o in all_orders:
+        by_shop.setdefault(o["shop"], []).append(o["order_id"])
+    for shop, order_ids in by_shop.items():
+        mark_orders_exported(shop, order_ids)
+
+    save_last_batch_export(all_orders)  # this re-export IS now the new "last batch"
+
+    response = send_file(tmp_path, as_attachment=True, download_name="auspost_reexport_last_batch.csv", mimetype="text/csv")
+    if not_found:
+        response.headers["X-Not-Found-Orders"] = ",".join(not_found)
+    return response
 
 
 @app.route("/scan")
