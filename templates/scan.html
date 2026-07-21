@@ -208,6 +208,18 @@
       display: inline-block;
     }
     #export-batch-btn:hover { background: #2d82c0; }
+    #fulfill-pdf-btn {
+      flex: none;
+      background: #2ecc71;
+      color: #000;
+      padding: 12px 22px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: bold;
+      font-size: 16px;
+      display: inline-block;
+    }
+    #fulfill-pdf-btn:hover { background: #27b365; }
     #reexport-last-batch-btn {
       flex: none;
       background: #4a3a10;
@@ -292,6 +304,7 @@
   </div>
   <div id="export-bar">
     <a id="export-batch-btn" href="/api/export_batch">📦 Export Batch to AusPost</a>
+    <a id="fulfill-pdf-btn" href="/fulfill-pdf">📮 Fulfil from AusPost PDF</a>
     <a id="reexport-last-batch-btn" href="/api/reexport_last_batch">↻ Re-export Last Batch</a>
     <span id="export-single-link" class="disabled" onclick="exportCurrentSingle()">export just this order</span>
   </div>
