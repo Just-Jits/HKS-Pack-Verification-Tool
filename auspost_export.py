@@ -19,7 +19,7 @@ SEND_FROM = {
     "suburb": "Vermont",
     "state": "VIC",
     "postcode": "3133",
-    "phone": "0422695001",
+    "phone": "61422695001",
     "email": "info@justjits.com",
 }
 
@@ -120,6 +120,31 @@ HEADERS = [
 # lodgement until 16 July 2026, so there's no valid explicit override we
 # could send for the mandated-country cases even if we wanted to right now.
 LANDED_COSTS_PAYER = ""
+
+
+def normalize_au_phone(phone):
+    """Converts an AU phone number to '61...' format (country code, no
+    leading 0, no +, no spaces/dashes) — e.g. '0416 123 123' -> '61416123123'.
+
+    Why: a number written as '0416123123' gets silently mangled to
+    '416123123' the moment anyone opens the CSV in Excel/Sheets to check it
+    — those apps auto-detect a leading-zero numeric string as a number, and
+    numbers don't have leading zeros. Writing it as '61416123123' instead
+    sidesteps the problem entirely: it's unambiguously a long digit string,
+    not something a spreadsheet app will "helpfully" reformat.
+
+    Only touches numbers that already look like AU numbers (start with 0 or
+    already start with 61) — deliberately leaves other countries' numbers
+    untouched, since e.g. a US customer's phone already carries its own
+    correct country code and prepending 61 to it would break it."""
+    if not phone:
+        return phone
+    digits = re.sub(r"[^\d]", "", phone)  # strip spaces, dashes, parens, +
+    if digits.startswith("61") and len(digits) >= 11:
+        return digits  # already in 61... format, just strip any punctuation
+    if digits.startswith("0"):
+        return "61" + digits[1:]  # 0416... -> 61416...
+    return phone  # doesn't look like an AU number — leave as-is
 
 
 def bucket_for(title):
@@ -227,8 +252,9 @@ def build_row(order):
         delivery_service = "EXP" if is_express else "PP"
         item_length, item_width, item_height = DOMESTIC_XS_OWN_LENGTH_CM, DOMESTIC_XS_OWN_WIDTH_CM, DOMESTIC_XS_OWN_HEIGHT_CM
     else:
-        # Domestic default — AusPost Small satchel at the standard dimensions.
-        packaging = "AP_SATCHEL_S"
+        # Domestic default — this is OUR OWN packaging/satchels, not
+        # AusPost's own "Small Satchel" product — at the standard dimensions.
+        packaging = "OWN_PACKAGING"
         delivery_service = "EXP" if is_express else "PP"
         item_length, item_width, item_height = DOMESTIC_SATCHEL_LENGTH_CM, DOMESTIC_SATCHEL_WIDTH_CM, DOMESTIC_SATCHEL_HEIGHT_CM
 
@@ -249,6 +275,11 @@ def build_row(order):
         business_name = raw_company
         company_overflow_note = ""
 
+    # Only normalize the AU leading-zero format for domestic orders —
+    # international customers' numbers already carry their own correct
+    # country code and shouldn't have 61 prepended on top of it.
+    deliver_to_phone = normalize_au_phone(addr.get("phone", "")) if not is_intl else addr.get("phone", "")
+
     row = [
         SEND_FROM["name"], SEND_FROM["business_name"], SEND_FROM["address_line_1"],
         SEND_FROM["address_line_2"], SEND_FROM["address_line_3"], SEND_FROM["suburb"],
@@ -257,7 +288,7 @@ def build_row(order):
         addr.get("country_code", "AU") if is_intl else "AU",
         addr.get("address1", ""), addr.get("address2", ""), "",
         addr.get("city", ""), addr.get("province_code", "") if not is_intl else addr.get("province", ""),
-        addr.get("zip", ""), addr.get("phone", ""), order.get("email", ""),
+        addr.get("zip", ""), deliver_to_phone, order.get("email", ""),
         packaging, delivery_service, "Apparel",
         item_length, item_width, item_height,
         TOTAL_WEIGHT_KG, "NO", "NO", "", CANNOT_BE_DELIVERED,

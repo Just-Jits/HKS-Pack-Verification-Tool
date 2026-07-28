@@ -621,15 +621,11 @@ def home():
     return render_template("home.html", shops=shops, app_url=APP_URL)
 
 
-def process_order_for_export(shop, order):
-    """Converts one raw Shopify order dict into the format the AusPost
-    export needs. Pulled out as its own function so both the normal
-    packed-ready flow and the re-export-by-exception flow can share it
-    rather than duplicating this logic."""
-    shipping_address = order.get("shipping_address") or {}
-    is_international = shipping_address.get("country_code", "AU") not in ("AU", "")
-    tags = [t.strip().lower() for t in (order.get("tags") or "").split(",")]
-
+def extract_export_line_items(order):
+    """Filters one order's raw Shopify line_items down to the {title,
+    quantity, price} shape the export needs, skipping removed/swapped
+    items via current_quantity. Pulled out of process_order_for_export so
+    it can also be called per-order when combining a merged pair."""
     line_items = []
     for li in order.get("line_items", []):
         # Skip items removed/swapped via a Shopify order edit — quantity
@@ -651,13 +647,41 @@ def process_order_for_export(shop, order):
             "quantity": current_qty,
             "price": float(li.get("price", 0)),
         })
+    return line_items
+
+
+def process_order_for_export(shop, order, merge_partner_order=None):
+    """Converts one raw Shopify order dict into the format the AusPost
+    export needs. Pulled out as its own function so both the normal
+    packed-ready flow and the re-export-by-exception flow can share it
+    rather than duplicating this logic.
+
+    merge_partner_order: if this order is shipping together with another
+    as ONE physical parcel (combined shipment), pass the partner's raw
+    order dict here — their line items get combined into a single export
+    row (one weight, one combined declared value via the existing
+    highest-value-item logic in group_line_items), and both order IDs get
+    returned so the caller can mark BOTH as exported/fulfilled together."""
+    shipping_address = order.get("shipping_address") or {}
+    is_international = shipping_address.get("country_code", "AU") not in ("AU", "")
+    tags = [t.strip().lower() for t in (order.get("tags") or "").split(",")]
+
+    line_items = extract_export_line_items(order)
+    order_number_label = order["name"]
+    extra_order_ids = []
+
+    if merge_partner_order:
+        line_items += extract_export_line_items(merge_partner_order)
+        order_number_label = f"{order['name']} + {merge_partner_order['name']}"
+        extra_order_ids = [merge_partner_order["id"]]
 
     shipping_lines = order.get("shipping_lines") or []
     shipping_line_title = shipping_lines[0].get("title", "") if shipping_lines else ""
 
     return {
         "order_id": order["id"],
-        "order_number": order["name"],
+        "extra_order_ids": extra_order_ids,
+        "order_number": order_number_label,
         "shop": shop,
         "shipping_address": shipping_address,
         "is_international": is_international,
@@ -709,12 +733,24 @@ def fetch_packed_ready_orders(shop, single_order_id=None):
                 seen_ids.add(order["id"])
                 raw_orders.append(order)
 
+    processed_order_ids = set()
     for order in raw_orders:
+        if order["id"] in processed_order_ids:
+            continue  # already included as the partner half of a merged pair
         tags = [t.strip().lower() for t in (order.get("tags") or "").split(",")]
         if single_order_id is None:
             if "packed-ready" not in tags or "auspost-exported" in tags:
                 continue
-        results.append(process_order_for_export(shop, order))
+
+        merge_partner_number = find_merge_partner_number(tags)
+        merge_partner_order = None
+        if merge_partner_number:
+            merge_partner_order = find_order_by_number_in_shop(shop, merge_partner_number)
+
+        results.append(process_order_for_export(shop, order, merge_partner_order=merge_partner_order))
+        processed_order_ids.add(order["id"])
+        if merge_partner_order:
+            processed_order_ids.add(merge_partner_order["id"])
     return results
 
 
@@ -728,6 +764,53 @@ def find_order_by_number_any_status(order_number):
         if data and data.get("orders"):
             return shop, data["orders"][0]
     return None, None
+
+
+def add_order_tag(shop, order_id, tag):
+    """Generic single-tag add, used by the merge-shipment feature. Distinct
+    from mark_orders_exported (which is specifically for auspost-exported)
+    since merge tags need to be added to two DIFFERENT orders with two
+    DIFFERENT tag values (each order gets a tag pointing at the OTHER
+    order's number), not the same tag applied in bulk."""
+    current = shopify_get(shop, f"orders/{order_id}.json")
+    if not current:
+        return False
+    existing_tags = [t.strip() for t in (current["order"].get("tags") or "").split(",") if t.strip()]
+    if not any(t.lower() == tag.lower() for t in existing_tags):
+        existing_tags.append(tag)
+        shopify_put(shop, f"orders/{order_id}.json", {
+            "order": {"id": order_id, "tags": ", ".join(existing_tags)}
+        })
+    return True
+
+
+MERGE_TAG_RE = re.compile(r"^merged-with-(\d+)$")
+
+
+def find_merge_partner_number(tags):
+    """tags: lowercased tag list off an order. Returns the partner order
+    number (str) if this order carries a 'merged-with-XXXX' tag, else None.
+    Reading the sibling's number straight out of the tag itself — rather
+    than searching Shopify for 'which order has a matching group tag' —
+    deliberately avoids depending on Shopify's tag SEARCH index at all,
+    which is the exact search-index-lag class of bug fixed earlier this
+    session for the packed-ready fetch. This only ever needs a direct
+    order-number lookup, which is immediate and not search-based."""
+    for t in tags:
+        m = MERGE_TAG_RE.match(t)
+        if m:
+            return m.group(1)
+    return None
+
+
+def find_order_by_number_in_shop(shop, order_number):
+    """Like find_order_by_number, but scoped to one specific shop rather
+    than searching every connected store — merges should only ever happen
+    between two orders in the SAME store."""
+    data = shopify_get(shop, "orders.json", params={"name": f"#{order_number}", "status": "any"})
+    if data and data.get("orders"):
+        return data["orders"][0]
+    return None
 
 
 def unmark_order_exported(shop, order_id):
@@ -807,7 +890,7 @@ def api_export_batch():
 
     by_shop = {}
     for o in all_orders:
-        by_shop.setdefault(o["shop"], []).append(o["order_id"])
+        by_shop.setdefault(o["shop"], []).extend([o["order_id"]] + o.get("extra_order_ids", []))
     for shop, order_ids in by_shop.items():
         mark_orders_exported(shop, order_ids)
 
@@ -876,7 +959,7 @@ def api_reexport_orders():
 
     by_shop = {}
     for o in all_orders:
-        by_shop.setdefault(o["shop"], []).append(o["order_id"])
+        by_shop.setdefault(o["shop"], []).extend([o["order_id"]] + o.get("extra_order_ids", []))
     for shop, order_ids in by_shop.items():
         mark_orders_exported(shop, order_ids)
 
@@ -924,7 +1007,7 @@ def api_reexport_last_batch():
 
     by_shop = {}
     for o in all_orders:
-        by_shop.setdefault(o["shop"], []).append(o["order_id"])
+        by_shop.setdefault(o["shop"], []).extend([o["order_id"]] + o.get("extra_order_ids", []))
     for shop, order_ids in by_shop.items():
         mark_orders_exported(shop, order_ids)
 
@@ -996,6 +1079,27 @@ def fulfill_pdf():
         if not ok:
             log_error("fulfill_pdf", f"order=#{order_number} shop={shop} tracking={tracking_number} | {message}")
 
+        # If this order shipped together with another as one combined
+        # parcel, the same tracking number belongs on both — the label
+        # only shows ONE order number, but the physical parcel covers two
+        # Shopify orders, so the second one needs fulfilling here too.
+        if ok:
+            tags = [t.strip().lower() for t in (order.get("tags") or "").split(",")]
+            partner_number = find_merge_partner_number(tags)
+            if partner_number:
+                partner_order = find_order_by_number_in_shop(shop, partner_number)
+                if partner_order:
+                    partner_ok, partner_message = fulfill_order_with_tracking(
+                        shop, partner_order["id"], tracking_number, pair["carrier"])
+                    results.append({
+                        "order_number": partner_order["name"], "tracking_number": tracking_number,
+                        "shop": shop, "ok": partner_ok,
+                        "message": f"(merged with #{order_number}) {partner_message}",
+                    })
+                    if not partner_ok:
+                        log_error("fulfill_pdf", f"order=#{partner_number} shop={shop} tracking={tracking_number} "
+                                                  f"| merge-partner fulfillment failed: {partner_message}")
+
     succeeded = sum(1 for r in results if r["ok"])
     failed = len(results) - succeeded
 
@@ -1033,6 +1137,50 @@ def fulfill_pdf():
     """
 
 
+AUTO_CONFIRM_KEYWORDS = ["package protection", "free return", "free returns"]
+
+
+def build_pack_screen_line_items(shop, order, from_order_number=None):
+    """Builds the pack-screen line item list for one order. Pulled out as
+    its own function so a merged shipment can call this once per order and
+    concatenate the results into a single combined checklist, rather than
+    duplicating this whole block. from_order_number tags each item with
+    which of the two merged orders it came from, purely for display —
+    None for the normal, non-merged case."""
+    line_items = []
+    for li in order["line_items"]:
+        # current_quantity accounts for order edits/removals — quantity
+        # alone still shows the ORIGINAL ordered amount even after an
+        # item has been fully swapped out or removed, so filtering on
+        # quantity would keep showing removed items as needing packing.
+        # Explicitly check for None rather than using "or" — a
+        # legitimate current_quantity of 0 (the removed-item case we're
+        # trying to catch) is falsy too, so "or" would wrongly undo the
+        # filter for exactly the case it's meant to handle.
+        current_qty = li.get("current_quantity", li["quantity"])
+        if current_qty is None:
+            current_qty = li["quantity"]
+        if current_qty == 0:
+            continue
+        barcode = li.get("barcode")
+        if not barcode:
+            barcode = lookup_live_barcode(shop, li.get("sku"))
+        title_lower = li["title"].lower()
+        auto_confirm = any(kw in title_lower for kw in AUTO_CONFIRM_KEYWORDS)
+        item = {
+            "id": li["id"],
+            "title": li["title"],
+            "sku": li.get("sku"),
+            "quantity": current_qty,
+            "barcode": barcode,
+            "auto_confirm": auto_confirm,
+        }
+        if from_order_number:
+            item["from_order"] = from_order_number
+        line_items.append(item)
+    return line_items
+
+
 @app.route("/api/lookup_order")
 def api_lookup_order():
     order_number = request.args.get("order_number", "").strip().lstrip("#")
@@ -1044,43 +1192,31 @@ def api_lookup_order():
         if not order:
             return jsonify({"error": f"Order #{order_number} not found in any connected store"}), 404
 
-        AUTO_CONFIRM_KEYWORDS = ["package protection", "free return", "free returns"]
+        line_items = build_pack_screen_line_items(shop, order)
 
-        line_items = []
-        for li in order["line_items"]:
-            # current_quantity accounts for order edits/removals — quantity
-            # alone still shows the ORIGINAL ordered amount even after an
-            # item has been fully swapped out or removed, so filtering on
-            # quantity would keep showing removed items as needing packing.
-            # Explicitly check for None rather than using "or" — a
-            # legitimate current_quantity of 0 (the removed-item case we're
-            # trying to catch) is falsy too, so "or" would wrongly undo the
-            # filter for exactly the case it's meant to handle.
-            current_qty = li.get("current_quantity", li["quantity"])
-            if current_qty is None:
-                current_qty = li["quantity"]
-            if current_qty == 0:
-                continue
-            barcode = li.get("barcode")
-            if not barcode:
-                barcode = lookup_live_barcode(shop, li.get("sku"))
-            title_lower = li["title"].lower()
-            auto_confirm = any(kw in title_lower for kw in AUTO_CONFIRM_KEYWORDS)
-            line_items.append({
-                "id": li["id"],
-                "title": li["title"],
-                "sku": li.get("sku"),
-                "quantity": current_qty,
-                "barcode": barcode,
-                "auto_confirm": auto_confirm,
-            })
+        tags_raw = order.get("tags") or ""
+        existing_tag_list = [t.strip().lower() for t in tags_raw.split(",")]
+
+        # If this order is merged with another, pull the partner order's
+        # items in too so the pack screen shows ONE combined checklist for
+        # both — reading the partner's number straight off the tag rather
+        # than searching for it (see find_merge_partner_number's docstring
+        # for why that matters).
+        merged_with_number = find_merge_partner_number(existing_tag_list)
+        merged_order_name = None
+        if merged_with_number:
+            partner_order = find_order_by_number_in_shop(shop, merged_with_number)
+            if partner_order:
+                merged_order_name = partner_order["name"]
+                line_items = (
+                    [dict(li, from_order=order["name"]) for li in line_items]
+                    + build_pack_screen_line_items(shop, partner_order, from_order_number=partner_order["name"])
+                )
 
         shipping_address = order.get("shipping_address") or {}
         shipping_country = shipping_address.get("country_code", "")
         is_international = shipping_country not in ("AU", "")
         estimated_weight = estimate_order_weight(line_items)
-        tags_raw = order.get("tags") or ""
-        existing_tag_list = [t.strip().lower() for t in tags_raw.split(",")]
         needs_express_tag = "express-upgrade" in existing_tag_list
 
         # small, single-product-type domestic orders that might qualify for
@@ -1130,10 +1266,65 @@ def api_lookup_order():
             "express_confirmed_tag": express_confirmed_tag,
             "needs_express_tag": needs_express_tag,
             "line_items": line_items,
+            "merged_with": merged_order_name,
         })
     except Exception as e:
         log_error("lookup_order", f"order_number={order_number} | {e}")
         return jsonify({"error": f"Internal error looking up order — see /logs for detail"}), 500
+
+
+@app.route("/api/find_order_for_merge")
+@login_required
+def api_find_order_for_merge():
+    """Preview step before merging — looks up the candidate partner order
+    (same shop only) and returns its name/address so the packer can
+    visually confirm it's genuinely the same customer before committing.
+    Doesn't tag anything yet; that only happens in /api/merge_orders."""
+    shop = request.args.get("shop", "")
+    order_number = request.args.get("order_number", "").strip().lstrip("#")
+    if not shop or not order_number:
+        return jsonify({"error": "missing shop or order_number"}), 400
+
+    order = find_order_by_number_in_shop(shop, order_number)
+    if not order:
+        return jsonify({"error": f"Order #{order_number} not found in {shop}"}), 404
+
+    addr = order.get("shipping_address") or {}
+    return jsonify({
+        "order_id": order["id"],
+        "order_number": order["name"],
+        "name": addr.get("name", ""),
+        "address1": addr.get("address1", ""),
+        "city": addr.get("city", ""),
+        "zip": addr.get("zip", ""),
+    })
+
+
+@app.route("/api/merge_orders", methods=["POST"])
+@login_required
+def api_merge_orders():
+    """Applies the merge tags: each order gets 'merged-with-<other order's
+    number>'. Both tags point directly at each other's order number rather
+    than a shared group ID — see find_merge_partner_number's docstring for
+    why (avoids any dependency on Shopify's tag search index)."""
+    body = request.get_json(force=True)
+    shop = body.get("shop")
+    order_id_a = body.get("order_id_a")
+    order_number_a = str(body.get("order_number_a", "")).lstrip("#")
+    order_id_b = body.get("order_id_b")
+    order_number_b = str(body.get("order_number_b", "")).lstrip("#")
+
+    if not all([shop, order_id_a, order_number_a, order_id_b, order_number_b]):
+        return jsonify({"error": "missing required fields", "ok": False}), 400
+
+    ok_a = add_order_tag(shop, order_id_a, f"merged-with-{order_number_b}")
+    ok_b = add_order_tag(shop, order_id_b, f"merged-with-{order_number_a}")
+
+    if not (ok_a and ok_b):
+        log_error("merge_orders", f"shop={shop} a=#{order_number_a} b=#{order_number_b} | one or both tag writes failed")
+        return jsonify({"error": "Failed to tag one or both orders — see /logs", "ok": False}), 500
+
+    return jsonify({"ok": True})
 
 
 @app.route("/api/confirm_check", methods=["POST"])
@@ -1176,12 +1367,22 @@ def api_mark_order():
         missing_items = body.get("missing_items", [])
         packed_by = session.get("logged_in_user", "unknown")
 
-        tag = "packed-ready" if status == "ready" else "packed-incomplete"
-
         current = shopify_get(shop, f"orders/{order_id}.json")
         if not current:
             log_error("mark_order", f"shop={shop} order_id={order_id} | failed to fetch current order — check token/scopes")
             return jsonify({"error": "Could not fetch order from Shopify — see /logs", "ok": False}), 500
+
+        # Local pickup orders have no shipping address at all in Shopify —
+        # these should never be eligible for AusPost export, so they get a
+        # different tag entirely rather than "packed-ready", which
+        # fetch_packed_ready_orders uses as its trigger for pulling orders
+        # into the export batch.
+        is_pickup = not current["order"].get("shipping_address")
+
+        if status == "ready":
+            tag = "packed-pickup" if is_pickup else "packed-ready"
+        else:
+            tag = "packed-incomplete"
 
         existing_tags = (current["order"].get("tags") or "")
         tag_list = [t.strip() for t in existing_tags.split(",") if t.strip()]
@@ -1207,6 +1408,22 @@ def api_mark_order():
         if status_code not in (200, 201):
             log_error("mark_order", f"shop={shop} order_id={order_id} | Shopify returned {status_code}: {resp}")
             return jsonify({"error": "failed to tag order — see /logs", "detail": resp, "ok": False}), 500
+
+        # If this order is merged with another (shipping together as one
+        # physical parcel), apply the same status tag to the partner order
+        # too — they need to move through packing as one unit, since only
+        # one of them will actually get exported/fulfilled with tracking.
+        partner_number = find_merge_partner_number([t.lower() for t in tag_list])
+        if partner_number:
+            partner_order = find_order_by_number_in_shop(shop, partner_number)
+            if partner_order:
+                partner_tags_raw = (partner_order.get("tags") or "")
+                partner_tag_list = [t.strip() for t in partner_tags_raw.split(",") if t.strip()]
+                if tag not in partner_tag_list:
+                    partner_tag_list.append(tag)
+                    shopify_put(shop, f"orders/{partner_order['id']}.json", {
+                        "order": {"id": partner_order["id"], "tags": ", ".join(partner_tag_list)}
+                    })
 
         return jsonify({"ok": True})
     except Exception as e:
