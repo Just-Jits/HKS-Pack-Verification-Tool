@@ -221,12 +221,41 @@ def auth_callback():
 
 # ---------- Shopify Admin API helper ----------
 
+# Shopify's REST endpoints use a leaky-bucket rate limit (40-request bucket,
+# leaks at 2/sec per shop); GraphQL uses a separate cost-based bucket. Neither
+# is generous enough to survive a big /fulfill-pdf batch (each parcel can
+# trigger up to 5 REST calls just locating the order across every connected
+# store, plus 2 GraphQL calls to fulfil) with zero retry logic — the bucket
+# empties partway through and every call after that silently 429s and gets
+# treated as a hard failure. This is why larger PDFs fail on whichever
+# orders happen to be processed last, in a cluster, rather than randomly.
+# A 429 always carries a Retry-After header (seconds) telling us exactly how
+# long to wait — respect it, then retry, up to MAX_RETRY_ATTEMPTS times.
+MAX_RETRY_ATTEMPTS = 4
+
+
+def shopify_request_with_retry(method, url, headers, **kwargs):
+    """Wraps requests.<method> with 429-aware retry/backoff. Returns the
+    final response object (which may still be non-200 after exhausting
+    retries — callers keep their existing non-200 handling as-is)."""
+    for attempt in range(MAX_RETRY_ATTEMPTS):
+        r = requests.request(method, url, headers=headers, **kwargs)
+        if r.status_code != 429:
+            return r
+        retry_after = float(r.headers.get("Retry-After", 2))
+        log_error("shopify_rate_limit", f"{url} | attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS} | "
+                                         f"sleeping {retry_after}s")
+        if attempt < MAX_RETRY_ATTEMPTS - 1:
+            time.sleep(retry_after)
+    return r
+
+
 def shopify_get(shop, path, params=None):
     token = get_token_for_shop(shop)
     if not token:
         return None
     url = f"https://{shop}/admin/api/{API_VERSION}/{path}"
-    r = requests.get(url, headers={"X-Shopify-Access-Token": token}, params=params or {})
+    r = shopify_request_with_retry("GET", url, headers={"X-Shopify-Access-Token": token}, params=params or {})
     if r.status_code != 200:
         return None
     return r.json()
@@ -246,7 +275,7 @@ def shopify_get_all_pages(shop, path, params, results_key):
     url = f"https://{shop}/admin/api/{API_VERSION}/{path}"
     next_params = dict(params or {})
     while url:
-        r = requests.get(url, headers={"X-Shopify-Access-Token": token}, params=next_params)
+        r = shopify_request_with_retry("GET", url, headers={"X-Shopify-Access-Token": token}, params=next_params)
         if r.status_code != 200:
             break
         data = r.json()
@@ -266,14 +295,14 @@ def shopify_get_all_pages(shop, path, params, results_key):
 def shopify_post(shop, path, payload):
     token = get_token_for_shop(shop)
     url = f"https://{shop}/admin/api/{API_VERSION}/{path}"
-    r = requests.post(url, headers={"X-Shopify-Access-Token": token}, json=payload)
+    r = shopify_request_with_retry("POST", url, headers={"X-Shopify-Access-Token": token}, json=payload)
     return r.status_code, (r.json() if r.text else {})
 
 
 def shopify_put(shop, path, payload):
     token = get_token_for_shop(shop)
     url = f"https://{shop}/admin/api/{API_VERSION}/{path}"
-    r = requests.put(url, headers={"X-Shopify-Access-Token": token}, json=payload)
+    r = shopify_request_with_retry("PUT", url, headers={"X-Shopify-Access-Token": token}, json=payload)
     return r.status_code, (r.json() if r.text else {})
 
 
@@ -288,8 +317,8 @@ def shopify_graphql(shop, query, variables=None):
         return None
     url = f"https://{shop}/admin/api/{API_VERSION}/graphql.json"
     try:
-        r = requests.post(
-            url,
+        r = shopify_request_with_retry(
+            "POST", url,
             headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
             json={"query": query, "variables": variables or {}},
             timeout=20,
@@ -399,8 +428,8 @@ def lookup_live_barcode(shop, sku):
     safe_sku = sku.replace('"', '\\"')
     variables = {"q": f'sku:"{safe_sku}"'}
     try:
-        r = requests.post(
-            url,
+        r = shopify_request_with_retry(
+            "POST", url,
             headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
             json={"query": query, "variables": variables},
             timeout=15,
@@ -566,17 +595,22 @@ mutation fulfillmentCreateV2($fulfillment: FulfillmentV2Input!) {
 """
 
 
-def fulfill_order_with_tracking(shop, rest_order_id, tracking_number, carrier="Australia Post"):
-    """Fulfills every currently-open fulfillment order on this Shopify order
-    and attaches the given tracking number. Returns (ok: bool, message: str).
+def fulfill_order_with_tracking(shop, rest_order_id, tracking_number, carrier="Australia Post",
+                                 limit_to_one_fo=False):
+    """Fulfills currently-open fulfillment order(s) on this Shopify order and
+    attaches the given tracking number. Returns (ok: bool, message: str).
 
-    NOTE: this fulfills ALL open fulfillment orders on the order, not a
-    specific subset of line items. That's correct for the normal case (one
-    order = one parcel = one label = one tracking number), but if an order
-    is ever legitimately split across two separate shipments (e.g. partial
-    stock from two locations), this would attach the same tracking number
-    to both halves. Worth a manual check for any order flagged with a
-    split-shipment tag before trusting this blindly on those."""
+    limit_to_one_fo: when False (default), fulfills EVERY currently-open
+    fulfillment order in one call — correct for the normal case (one order
+    = one parcel = one label = one tracking number). When True, fulfills
+    only the FIRST currently-open fulfillment order and leaves the rest
+    untouched — use this when an order has multiple physical parcels in
+    the same PDF batch (i.e. the same order_number shows up against more
+    than one tracking number). Without this, the first tracking number
+    processed would consume every open fulfillment order at once, leaving
+    nothing open for the second parcel's tracking number to attach to — it
+    would then fail with "No open fulfillment orders", which looks like a
+    missed/dropped label pair even though extraction found it correctly."""
     gid = f"gid://shopify/Order/{rest_order_id}"
     result = shopify_graphql(shop, FULFILLMENT_ORDERS_QUERY, {"orderId": gid})
     if not result or result.get("errors"):
@@ -593,6 +627,9 @@ def fulfill_order_with_tracking(shop, rest_order_id, tracking_number, carrier="A
     ]
     if not open_fo_ids:
         return False, "No open fulfillment orders — likely already fulfilled, cancelled, or on hold"
+
+    if limit_to_one_fo:
+        open_fo_ids = open_fo_ids[:1]
 
     fulfillment_input = {
         "lineItemsByFulfillmentOrder": [{"fulfillmentOrderId": fo_id} for fo_id in open_fo_ids],
@@ -1059,6 +1096,15 @@ def fulfill_pdf():
         return jsonify({"error": "No order/tracking pairs found in this PDF — "
                                   "check it's an AusPost label export, not a different document"}), 400
 
+    # Some orders print more than one physical label (multiple parcels for
+    # one Shopify order) — those show up here as the same order_number
+    # against two+ different tracking_numbers. Track the count so each one
+    # only claims a single fulfillment order instead of the first one
+    # grabbing them all. See fulfill_order_with_tracking's limit_to_one_fo.
+    order_parcel_counts = {}
+    for pair in pairs:
+        order_parcel_counts[pair["order_number"]] = order_parcel_counts.get(pair["order_number"], 0) + 1
+
     results = []
     for pair in pairs:
         order_number = pair["order_number"]
@@ -1071,7 +1117,11 @@ def fulfill_pdf():
             })
             continue
 
-        ok, message = fulfill_order_with_tracking(shop, order["id"], tracking_number, pair["carrier"])
+        is_multi_parcel = order_parcel_counts[order_number] > 1
+        ok, message = fulfill_order_with_tracking(
+            shop, order["id"], tracking_number, pair["carrier"],
+            limit_to_one_fo=is_multi_parcel,
+        )
         results.append({
             "order_number": order_number, "tracking_number": tracking_number,
             "shop": shop, "ok": ok, "message": message,
