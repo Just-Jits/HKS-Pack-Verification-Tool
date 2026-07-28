@@ -231,7 +231,14 @@ def auth_callback():
 # orders happen to be processed last, in a cluster, rather than randomly.
 # A 429 always carries a Retry-After header (seconds) telling us exactly how
 # long to wait — respect it, then retry, up to MAX_RETRY_ATTEMPTS times.
-MAX_RETRY_ATTEMPTS = 4
+# Kept deliberately small (2 attempts, capped wait) — this runs SYNCHRONOUSLY
+# inside a single request handler that's already making dozens of sequential
+# Shopify calls for a big PDF batch, so retries here eat directly into
+# gunicorn's worker timeout. Bulletproof rate-limit handling would queue this
+# as a background job instead of retrying inline — see note on
+# gunicorn --timeout below for why that matters for now.
+MAX_RETRY_ATTEMPTS = 2
+MAX_RETRY_WAIT_SECONDS = 5
 
 
 def shopify_request_with_retry(method, url, headers, **kwargs):
@@ -242,7 +249,7 @@ def shopify_request_with_retry(method, url, headers, **kwargs):
         r = requests.request(method, url, headers=headers, **kwargs)
         if r.status_code != 429:
             return r
-        retry_after = float(r.headers.get("Retry-After", 2))
+        retry_after = min(float(r.headers.get("Retry-After", 2)), MAX_RETRY_WAIT_SECONDS)
         log_error("shopify_rate_limit", f"{url} | attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS} | "
                                          f"sleeping {retry_after}s")
         if attempt < MAX_RETRY_ATTEMPTS - 1:
