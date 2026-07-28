@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pack Verify</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, system-ui, sans-serif;
+      background: #111;
+      color: #fff;
+      margin: 0;
+      padding: 20px;
+      min-height: 100vh;
+    }
+    #scan-input {
+      position: fixed;
+      top: -100px;
+      opacity: 0;
+    }
+    .header {
+      font-size: 14px;
+      color: #888;
+      text-align: center;
+      margin-bottom: 10px;
+    }
+    .idle {
+      text-align: center;
+      padding: 80px 20px;
+      font-size: 28px;
+      color: #555;
+    }
+    .order-card {
+      max-width: 700px;
+      margin: 0 auto;
+    }
+    .order-title {
+      font-size: 32px;
+      font-weight: bold;
+      text-align: center;
+      margin-bottom: 4px;
+    }
+    .order-shop {
+      text-align: center;
+      color: #888;
+      margin-bottom: 20px;
+    }
+    .line-item {
+      background: #1d1d1d;
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 20px;
+      border: 2px solid #333;
+      transition: all 0.15s ease;
+    }
+    .line-item.complete {
+      border-color: #2ecc71;
+      background: #102a1a;
+    }
+    .line-item.flash-green {
+      border-color: #2ecc71;
+      background: #1d6b3d;
+    }
+    .line-item.flash-red {
+      border-color: #e74c3c;
+      background: #6b1d1d;
+    }
+    .qty-badge {
+      font-weight: bold;
+      font-size: 18px;
+      padding: 4px 14px;
+      border-radius: 20px;
+      background: #333;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .qty-badge.complete { background: #2ecc71; color: #000; }
+    .manual-confirm {
+      flex: none;
+      padding: 8px 14px;
+      font-size: 13px;
+      background: #333;
+      color: #ccc;
+      border-radius: 6px;
+    }
+    .manual-confirm:hover { background: #444; }
+    .actions {
+      display: flex;
+      gap: 12px;
+      margin-top: 24px;
+      max-width: 700px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    button {
+      flex: 1;
+      padding: 16px;
+      font-size: 18px;
+      border-radius: 10px;
+      border: none;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    #btn-complete {
+      background: #2ecc71;
+      color: #000;
+    }
+    #btn-complete:disabled {
+      background: #2a4a36;
+      color: #555;
+      cursor: not-allowed;
+    }
+    #btn-incomplete {
+      background: #e74c3c;
+      color: #fff;
+    }
+    .missing-picker {
+      max-width: 700px;
+      margin: 20px auto;
+      background: #1d1d1d;
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .missing-picker label {
+      display: block;
+      padding: 10px;
+      font-size: 18px;
+      cursor: pointer;
+    }
+    .missing-picker input { margin-right: 10px; transform: scale(1.5); }
+    .error-banner {
+      max-width: 700px;
+      margin: 0 auto;
+      background: #6b1d1d;
+      padding: 16px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 20px;
+    }
+    .warn-banner {
+      max-width: 700px;
+      margin: 0 auto 16px auto;
+      background: #4a3a10;
+      border: 2px solid #e7a23c;
+      padding: 14px 20px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 18px;
+      color: #f0c47a;
+    }
+    .express-banner {
+      max-width: 700px;
+      margin: 0 auto 16px auto;
+      background: #5a1a1a;
+      border: 2px solid #ff4d4d;
+      padding: 16px 20px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 19px;
+      font-weight: bold;
+      color: #ffb3b3;
+    }
+    .express-banner button {
+      margin-top: 10px;
+      background: #ff4d4d;
+      color: #fff;
+    }
+    #visible-input-wrap {
+      max-width: 700px;
+      margin: 0 auto 16px auto;
+      text-align: center;
+    }
+    #visible-input {
+      background: #1d1d1d;
+      border: 1px solid #444;
+      color: #fff;
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-size: 16px;
+      width: 260px;
+    }
+    /* Export bar — always visible regardless of scan state. Batch is the
+       primary action since most sessions end with a stack of orders, not
+       just one; single-order export is kept as a smaller secondary link
+       for one-offs. */
+    #export-bar {
+      max-width: 700px;
+      margin: 0 auto 20px auto;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: center;
+    }
+    #export-batch-btn {
+      flex: none;
+      background: #3498db;
+      color: #fff;
+      padding: 12px 22px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: bold;
+      font-size: 16px;
+      display: inline-block;
+    }
+    #export-batch-btn:hover { background: #2d82c0; }
+    #fulfill-pdf-btn {
+      flex: none;
+      background: #2ecc71;
+      color: #000;
+      padding: 12px 22px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: bold;
+      font-size: 16px;
+      display: inline-block;
+    }
+    #fulfill-pdf-btn:hover { background: #27b365; }
+    #reexport-last-batch-btn {
+      flex: none;
+      background: #4a3a10;
+      border: 1px solid #e7a23c;
+      color: #f0c47a;
+      padding: 12px 18px;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: bold;
+      font-size: 15px;
+      display: inline-block;
+    }
+    #reexport-last-batch-btn:hover { background: #5c481a; }
+    #export-single-link {
+      flex: none;
+      color: #888;
+      font-size: 14px;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+    #export-single-link:hover { color: #aaa; }
+    #export-single-link.disabled {
+      color: #444;
+      cursor: not-allowed;
+      text-decoration: none;
+    }
+    /* Re-export by exception — deliberately separate from the main export
+       bar so it doesn't get mistaken for the everyday action. Collapsed
+       behind a toggle since it's an occasional fix-up tool, not something
+       used every packing session. */
+    #reexport-toggle {
+      max-width: 700px;
+      margin: 0 auto 8px auto;
+      text-align: center;
+      color: #666;
+      font-size: 13px;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+    #reexport-toggle:hover { color: #888; }
+    #reexport-panel {
+      max-width: 700px;
+      margin: 0 auto 20px auto;
+      background: #1d1d1d;
+      border: 1px solid #444;
+      border-radius: 10px;
+      padding: 14px 18px;
+      display: none;
+    }
+    #reexport-panel.open { display: block; }
+    #reexport-panel .label {
+      font-size: 13px;
+      color: #aaa;
+      margin-bottom: 8px;
+    }
+    #reexport-panel input {
+      background: #111;
+      border: 1px solid #444;
+      color: #fff;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 14px;
+      width: 100%;
+      box-sizing: border-box;
+      margin-bottom: 10px;
+    }
+    #reexport-panel button {
+      background: #e7a23c;
+      color: #000;
+      padding: 10px 16px;
+      font-size: 14px;
+      width: auto;
+    }
+    /* Combined/merged shipment UI */
+    .merge-badge {
+      max-width: 700px;
+      margin: 0 auto 16px auto;
+      background: #1a3a4a;
+      border: 2px solid #3ca2e7;
+      padding: 10px 16px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 15px;
+      color: #a7d8f0;
+    }
+    #merge-toggle {
+      max-width: 700px;
+      margin: 0 auto 8px auto;
+      text-align: center;
+      color: #666;
+      font-size: 13px;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+    #merge-toggle:hover { color: #888; }
+    #merge-panel {
+      max-width: 700px;
+      margin: 0 auto 16px auto;
+      background: #1d1d1d;
+      border: 1px solid #444;
+      border-radius: 10px;
+      padding: 14px 18px;
+      display: none;
+    }
+    #merge-panel.open { display: block; }
+    #merge-panel .label {
+      font-size: 13px;
+      color: #aaa;
+      margin-bottom: 8px;
+    }
+    #merge-panel input {
+      background: #111;
+      border: 1px solid #444;
+      color: #fff;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 14px;
+      width: 100%;
+      box-sizing: border-box;
+      margin-bottom: 10px;
+    }
+    #merge-panel button {
+      background: #3ca2e7;
+      color: #000;
+      padding: 10px 16px;
+      font-size: 14px;
+      width: auto;
+    }
+    #merge-preview {
+      margin-top: 12px;
+      padding: 12px;
+      background: #111;
+      border-radius: 8px;
+      display: none;
+    }
+    #merge-preview.open { display: block; }
+    #merge-preview .warn-text {
+      color: #e7a23c;
+      font-size: 13px;
+      margin-top: 8px;
+      margin-bottom: 10px;
+    }
+  </style>
+</head>
+<body>
+  <input type="text" id="scan-input" autofocus>
+  <div class="header">Scan an order barcode to begin — logged in as {{ current_user }} (<a href="/logout" style="color:#888;">log out</a>)</div>
+  <div id="visible-input-wrap">
+    <input type="text" id="visible-input" placeholder="Or type order/product number here">
+    <button id="new-order-btn" onclick="startNewOrder()" style="margin-left:10px; padding:10px 16px; background:#333; color:#fff; border-radius:8px;">🔄 New Order</button>
+  </div>
+  <div id="export-bar">
+    <a id="export-batch-btn" href="/api/export_batch">📦 Export Batch to AusPost</a>
+    <a id="fulfill-pdf-btn" href="/fulfill-pdf">📮 Fulfil from AusPost PDF</a>
+    <a id="reexport-last-batch-btn" href="/api/reexport_last_batch">↻ Re-export Last Batch</a>
+    <span id="export-single-link" class="disabled" onclick="exportCurrentSingle()">export just this order</span>
+  </div>
+  <div id="reexport-toggle" onclick="toggleReexportPanel()">⚠️ Need to re-export specific orders that errored?</div>
+  <div id="reexport-panel">
+    <div class="label">Comma-separated order numbers (# optional) — e.g. 16341, 16342, 3812. This removes their "already exported" tag and re-generates a fresh CSV for just these, without touching any other orders.</div>
+    <input type="text" id="reexport-input" placeholder="16341, 16342, 3812">
+    <button onclick="reexportOrders()">Re-export these orders</button>
+  </div>
+  <div id="content">
+    <div class="idle">📦 Ready to scan</div>
+  </div>
+  <audio id="sound-ding" src="data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=" preload="auto"></audio>
+  <script>
+    const input = document.getElementById('scan-input');
+    const content = document.getElementById('content');
+    let currentOrder = null; // { shop, order_id, order_number, line_items: [{...,scanned_count}] }
+    let lastCompletedOrder = null; // { shop, order_id, order_number } — kept after marking ready, so the secondary single-order link stays usable
+    let buffer = "";
+    let bufferTimer = null;
+    // keep focus on hidden input always, so scanner keystrokes land here —
+    // but don't steal focus if the person is actively using the visible fallback field
+    function refocus() {
+      if (document.activeElement !== visibleInput) {
+        input.focus();
+      }
+    }
+    setInterval(refocus, 500);
+    document.addEventListener('click', (e) => {
+      if (e.target !== visibleInput) refocus();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        handleScan(input.value.trim());
+        input.value = "";
+      }
+    });
+    const visibleInput = document.getElementById('visible-input');
+    visibleInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        handleScan(visibleInput.value.trim());
+        visibleInput.value = "";
+      }
+    });
+    function beep(type) {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = type === 'good' ? 880 : 200;
+      gain.gain.value = 0.3;
+      osc.start();
+      osc.stop(ctx.currentTime + (type === 'good' ? 0.15 : 0.35));
+    }
+    function startNewOrder() {
+      currentOrder = null;
+      renderIdle();
+    }
+    function updateExportSingleLink() {
+      const el = document.getElementById('export-single-link');
+      if (lastCompletedOrder) {
+        el.classList.remove('disabled');
+        el.textContent = `export just #${lastCompletedOrder.order_number} to AusPost`;
+      } else {
+        el.classList.add('disabled');
+        el.textContent = 'export just this order';
+      }
+    }
+    function exportCurrentSingle() {
+      if (!lastCompletedOrder) return;
+      window.location.href = `/api/export_single?shop=${encodeURIComponent(lastCompletedOrder.shop)}&order_id=${lastCompletedOrder.order_id}`;
+    }
+    function toggleReexportPanel() {
+      document.getElementById('reexport-panel').classList.toggle('open');
+    }
+    function reexportOrders() {
+      const raw = document.getElementById('reexport-input').value.trim();
+      if (!raw) return;
+      // Just navigate to the endpoint directly — it streams the CSV back
+      // as a file download, same pattern as the batch/single export links.
+      window.location.href = `/api/reexport_orders?orders=${encodeURIComponent(raw)}`;
+    }
+    function handleScan(value) {
+      if (!currentOrder) {
+        if (!value) return;
+        lookupOrder(value);
+        return;
+      }
+      const allDone = currentOrder.line_items.every(li => li.scanned_count >= li.quantity);
+      const expressBlocked = currentOrder.needs_express_tag && !currentOrder.express_confirmed;
+      if (!value && allDone && !expressBlocked) {
+        // empty Enter press while everything's already green — same as
+        // clicking "Mark Ready" manually, so the scanner hand never has to
+        // touch the mouse for a fully-clean order
+        completeOrder();
+        return;
+      }
+      if (!value) return;
+      matchProduct(value);
+    }
+    async function lookupOrder(orderNumber) {
+      content.innerHTML = `<div class="idle">Looking up order ${orderNumber}...</div>`;
+      try {
+        const res = await fetch(`/api/lookup_order?order_number=${encodeURIComponent(orderNumber)}`);
+        const data = await res.json();
+        if (data.error) {
+          currentOrder = null;
+          content.innerHTML = `<div class="error-banner">${data.error}</div>`;
+          beep('bad');
+          setTimeout(() => { renderIdle(); }, 2000);
+          return;
+        }
+        currentOrder = data;
+        currentOrder.line_items = currentOrder.line_items.map(li => ({
+          ...li,
+          scanned_count: li.auto_confirm ? li.quantity : 0
+        }));
+        renderOrder();
+      } catch (err) {
+        content.innerHTML = `<div class="error-banner">Error: ${err.message || 'failed to reach server'}</div>`;
+      }
+    }
+    function matchProduct(barcode) {
+      const items = currentOrder.line_items;
+      // find an item with this barcode (or sku as fallback) that isn't fully scanned yet
+      let match = items.find(li => (li.barcode === barcode || li.sku === barcode) && li.scanned_count < li.quantity);
+      if (!match) {
+        // check if it's a valid item but already fully scanned (over-scan)
+        let overscan = items.find(li => li.barcode === barcode || li.sku === barcode);
+        beep('bad');
+        flashOrderRed();
+        renderOrder(overscan ? `Already scanned all of: ${overscan.title}` : `Not in this order: ${barcode}`);
+        return;
+      }
+      match.scanned_count += 1;
+      beep('good');
+      renderOrder();
+    }
+    function flashOrderRed() {
+      // visual handled via re-render message; could enhance with full-screen flash
+    }
+    function renderIdle() {
+      content.innerHTML = `<div class="idle">📦 Ready to scan</div>`;
+    }
+    function resetItem(idx) {
+      const li = currentOrder.line_items[idx];
+      if (li.scanned_count > 0) {
+        li.scanned_count -= 1;
+      }
+      renderOrder();
+    }
+    function manualConfirm(idx) {
+      const li = currentOrder.line_items[idx];
+      li.scanned_count = Math.min(li.scanned_count + 1, li.quantity);
+      beep('good');
+      renderOrder();
+    }
+    function renderOrder(message) {
+      const items = currentOrder.line_items.map((li, idx) => {
+        const complete = li.scanned_count >= li.quantity;
+        const noBarcode = !li.barcode;
+        return `
+          <div class="line-item ${complete ? 'complete' : ''}">
+            <div>
+              ${li.title}${li.sku ? ' <span style="color:#888;font-size:14px;">(' + li.sku + ')</span>' : ''}
+              ${noBarcode ? '<div style="color:#e7a23c;font-size:13px;margin-top:4px;">No barcode on file — tap Confirm to verify by hand</div>' : ''}
+            </div>
+            <div style="display:flex; align-items:center; gap:10px;">
+              <div class="qty-badge ${complete ? 'complete' : ''}" onclick="resetItem(${idx})" style="cursor:pointer;" title="Tap to undo last scan">${li.scanned_count} / ${li.quantity}</div>
+              ${!complete ? `<button class="manual-confirm" onclick="manualConfirm(${idx})">Confirm</button>` : ''}
+            </div>
+          </div>
+        `;
+      }).join("");
+      const allDone = currentOrder.line_items.every(li => li.scanned_count >= li.quantity);
+      const expressBlocked = currentOrder.needs_express_tag && !currentOrder.express_confirmed;
+      const canMarkReady = allDone && !expressBlocked;
+      let weightBannerHtml = "";
+      if (currentOrder.checks?.ask_xs_satchel && !currentOrder.xs_satchel_confirmed) {
+        weightBannerHtml += `
+          <div class="warn-banner">
+            Does this weigh under 250g and fit into an XS Satchel?
+            <button onclick="confirmCheck('xs-satchel-ok')">Yes</button>
+            <button onclick="dismissCheck('xs')">No</button>
+          </div>`;
+      }
+      if (currentOrder.checks?.ask_express_upgrade && !currentOrder.express_confirmed_tag) {
+        weightBannerHtml += `
+          <div class="warn-banner">
+            Does this international parcel weigh over 2kg?
+            <button onclick="confirmCheck('confirmed-express')">Yes</button>
+            <button onclick="dismissCheck('exp')">No</button>
+          </div>`;
+      }
+      if (currentOrder.checks?.ask_split_shipment && !currentOrder.split_shipment_confirmed) {
+        weightBannerHtml += `
+          <div class="warn-banner">
+            Does this domestic parcel weigh over 5kg? If yes, split into 2 parcels.
+            <button onclick="confirmCheck('needs-split-shipment')">Yes</button>
+            <button onclick="dismissCheck('split')">No</button>
+          </div>`;
+      }
+      // International equivalent of the domestic split question — only
+      // shown as a follow-up once the packer has already confirmed the
+      // parcel is over 2kg (international Express-weight check), since
+      // that's specifically when a genuinely heavy international order
+      // might also need splitting into two parcels.
+      if (currentOrder.checks?.ask_express_upgrade && currentOrder.express_confirmed_tag
+          && !currentOrder.split_shipment_confirmed && !currentOrder.intl_split_dismissed) {
+        weightBannerHtml += `
+          <div class="warn-banner">
+            Does this international parcel also need to be split into 2 parcels?
+            <button onclick="confirmCheck('needs-split-shipment')">Yes</button>
+            <button onclick="dismissIntlSplit()">No</button>
+          </div>`;
+      }
+      let expressBannerHtml = "";
+      if (currentOrder.needs_express_tag) {
+        if (currentOrder.express_confirmed) {
+          expressBannerHtml = `<div class="warn-banner">✅ Express upgrade confirmed in AusPost</div>`;
+        } else {
+          expressBannerHtml = `
+            <div class="express-banner">
+              🚀 EXPRESS REQUIRED — go set this order to Express in the AusPost app before packing<br>
+              <button onclick="confirmExpress()">✅ I've set this to Express</button>
+            </div>
+          `;
+        }
+      }
+      let mergeBadgeHtml = "";
+      if (currentOrder.merged_with) {
+        mergeBadgeHtml = `<div class="merge-badge">🔗 Merged with Order #${currentOrder.merged_with} — shipping together as one parcel</div>`;
+      }
+      content.innerHTML = `
+        <div class="order-card">
+          <div class="order-title">Order ${currentOrder.order_number}</div>
+          <div class="order-shop">${currentOrder.shop}${currentOrder.customer ? ' — ' + currentOrder.customer : ''}</div>
+          ${mergeBadgeHtml}
+          ${expressBannerHtml}
+          ${weightBannerHtml}
+          ${message ? `<div class="error-banner" style="margin-bottom:16px;">${message}</div>` : ""}
+          ${items}
+          <div class="actions">
+            <button id="btn-complete" ${canMarkReady ? "" : "disabled"} onclick="completeOrder()">✅ Mark Ready</button>
+            <button id="btn-incomplete" onclick="showMissingPicker()">⚠️ Missing Item</button>
+          </div>
+          <div id="missing-area"></div>
+          ${!currentOrder.merged_with ? `
+            <div id="merge-toggle" onclick="toggleMergePanel()">🔗 Ships together with another order? Merge shipments</div>
+            <div id="merge-panel">
+              <div class="label">Enter the other order's number (e.g. from the same customer, ordered close together) — this combines both into ONE parcel/label, not two separate Shopify orders.</div>
+              <input type="text" id="merge-input" placeholder="9618">
+              <button onclick="findOrderForMerge()">Find order</button>
+              <div id="merge-preview"></div>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    }
+    function toggleMergePanel() {
+      document.getElementById('merge-panel').classList.toggle('open');
+    }
+    async function findOrderForMerge() {
+      const raw = document.getElementById('merge-input').value.trim();
+      if (!raw) return;
+      const preview = document.getElementById('merge-preview');
+      preview.classList.add('open');
+      preview.innerHTML = 'Looking up order...';
+      try {
+        const res = await fetch(`/api/find_order_for_merge?shop=${encodeURIComponent(currentOrder.shop)}&order_number=${encodeURIComponent(raw)}`);
+        const data = await res.json();
+        if (data.error) {
+          preview.innerHTML = `<div class="warn-text">${data.error}</div>`;
+          return;
+        }
+        // Warn but allow — always show the found order's address so the
+        // packer can visually confirm it's genuinely the same customer,
+        // but never hard-block the merge on an address mismatch (could be
+        // a legitimate reformatting difference, e.g. "Unit 5" vs "5/").
+        preview.innerHTML = `
+          <div>Found: <b>Order ${data.order_number}</b></div>
+          <div style="margin-top:6px;">${data.name}<br>${data.address1}<br>${data.city} ${data.zip}</div>
+          <div class="warn-text">⚠️ Double-check this is the same customer/address as the current order before confirming.</div>
+          <button onclick="confirmMerge('${data.order_id}', '${data.order_number.replace('#','')}')">Confirm Merge</button>
+          <button onclick="cancelMergePreview()" style="background:#333; color:#fff; margin-left:8px;">Cancel</button>
+        `;
+      } catch (err) {
+        preview.innerHTML = `<div class="warn-text">Error: ${err.message || 'failed to reach server'}</div>`;
+      }
+    }
+    function cancelMergePreview() {
+      document.getElementById('merge-preview').classList.remove('open');
+      document.getElementById('merge-preview').innerHTML = '';
+    }
+    async function confirmMerge(partnerOrderId, partnerOrderNumber) {
+      const res = await fetch('/api/merge_orders', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          shop: currentOrder.shop,
+          order_id_a: currentOrder.order_id,
+          order_number_a: currentOrder.order_number.replace('#',''),
+          order_id_b: partnerOrderId,
+          order_number_b: partnerOrderNumber,
+        })
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert('Failed to merge orders: ' + JSON.stringify(data.error || data));
+        return;
+      }
+      // Re-fetch this order so the combined checklist (both orders' items) loads
+      lookupOrder(currentOrder.order_number.replace('#',''));
+    }
+    async function confirmCheck(tag) {
+      await fetch('/api/confirm_check', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({shop: currentOrder.shop, order_id: currentOrder.order_id, tag: tag})
+      });
+      if (tag === 'xs-satchel-ok') currentOrder.xs_satchel_confirmed = true;
+      if (tag === 'confirmed-express') currentOrder.express_confirmed_tag = true;
+      if (tag === 'needs-split-shipment') currentOrder.split_shipment_confirmed = true;
+      renderOrder();
+    }
+    function dismissCheck(which) {
+      // "No" just hides that question for this viewing — doesn't tag anything,
+      // since "no" means the default behaviour (small satchel / standard / single parcel) is correct
+      if (which === 'xs') currentOrder.checks.ask_xs_satchel = false;
+      if (which === 'exp') currentOrder.checks.ask_express_upgrade = false;
+      if (which === 'split') currentOrder.checks.ask_split_shipment = false;
+      renderOrder();
+    }
+    function dismissIntlSplit() {
+      currentOrder.intl_split_dismissed = true;
+      renderOrder();
+    }
+    function confirmExpress() {
+      currentOrder.express_confirmed = true;
+      renderOrder();
+    }
+    function showMissingPicker() {
+      const area = document.getElementById('missing-area');
+      const options = currentOrder.line_items.map((li, idx) => `
+        <label>
+          <input type="checkbox" value="${idx}"> ${li.title} (need ${li.quantity}, have ${li.scanned_count})
+        </label>
+      `).join("");
+      area.innerHTML = `
+        <div class="missing-picker">
+          <div style="margin-bottom:10px; font-weight:bold;">Which item(s) are missing?</div>
+          ${options}
+          <button style="margin-top:10px; background:#e74c3c; color:#fff;" onclick="submitIncomplete()">Confirm — Mark Incomplete</button>
+        </div>
+      `;
+    }
+    async function submitIncomplete() {
+      const checked = Array.from(document.querySelectorAll('.missing-picker input:checked'));
+      const missing = checked.map(c => currentOrder.line_items[parseInt(c.value)]);
+      const res = await fetch('/api/mark_order', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          shop: currentOrder.shop,
+          order_id: currentOrder.order_id,
+          status: 'incomplete',
+          missing_items: missing.map(m => ({title: m.title, sku: m.sku}))
+        })
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert('Failed to tag order as incomplete: ' + JSON.stringify(data.detail || data.error));
+        return;
+      }
+      currentOrder = null;
+      renderIdle();
+    }
+    async function completeOrder() {
+      const res = await fetch('/api/mark_order', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          shop: currentOrder.shop,
+          order_id: currentOrder.order_id,
+          status: 'ready'
+        })
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert('Failed to mark order ready: ' + JSON.stringify(data.detail || data.error));
+        return;
+      }
+      // Keep a reference to the just-completed order so the secondary
+      // "export just this order" link stays usable after the screen resets —
+      // the primary path is Export Batch, up in the persistent export bar.
+      lastCompletedOrder = {
+        shop: currentOrder.shop,
+        order_id: currentOrder.order_id,
+        order_number: currentOrder.order_number,
+      };
+      updateExportSingleLink();
+      currentOrder = null;
+      renderIdle();
+    }
+  </script>
+</body>
+</html>
