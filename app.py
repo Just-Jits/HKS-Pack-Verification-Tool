@@ -3,8 +3,10 @@ import re
 import json
 import time
 import hmac
+import uuid
 import hashlib
 import tempfile
+import threading
 import requests
 import pdfplumber
 from flask import Flask, request, redirect, render_template, jsonify, session, send_file
@@ -1163,6 +1165,104 @@ def scan():
     return render_template("scan.html", current_user=session.get("logged_in_user"))
 
 
+# Background job store for /fulfill-pdf. Even with a raised gunicorn
+# --timeout, a big batch can still legitimately take longer than any fixed
+# request timeout once Shopify rate-limiting (429 retries) is factored in —
+# that's what kept killing this route via WORKER TIMEOUT even after bumping
+# the timeout to 180s. Rather than chasing an ever-higher timeout number,
+# the request now just kicks off a background thread and returns
+# immediately; the page polls /fulfill-pdf/status/<job_id> for progress.
+# Plain in-memory dict is fine here since this runs as a single gunicorn
+# worker (sync, 1 replica) — if that ever changes to multiple workers/
+# replicas, this would need to move to something shared (e.g. a small
+# Postgres/Redis-backed store) since each worker has its own memory.
+FULFILL_JOBS = {}
+FULFILL_JOBS_LOCK = threading.Lock()
+
+
+def render_fulfill_results_table(results):
+    row_parts = []
+    for r in results:
+        row_bg = "#1a3d1a" if r["ok"] else "#3d1a1a"
+        status_icon = "✅" if r["ok"] else "❌"
+        store_label = r["shop"] or "—"
+        row_parts.append(
+            f"<tr style='background:{row_bg};'>"
+            f"<td style='padding:8px;'>#{r['order_number']}</td>"
+            f"<td style='padding:8px;'>{r['tracking_number']}</td>"
+            f"<td style='padding:8px;'>{store_label}</td>"
+            f"<td style='padding:8px;'>{status_icon}</td>"
+            f"<td style='padding:8px;'>{r['message']}</td></tr>"
+        )
+    return "".join(row_parts)
+
+
+def run_fulfillment_job(job_id, pairs):
+    """The actual Shopify fulfillment loop, run in a background thread.
+    Updates FULFILL_JOBS[job_id] after every parcel so the status endpoint
+    always has current progress to report, not just a final result."""
+    order_parcel_counts = {}
+    for pair in pairs:
+        order_parcel_counts[pair["order_number"]] = order_parcel_counts.get(pair["order_number"], 0) + 1
+
+    results = []
+    try:
+        for pair in pairs:
+            order_number = pair["order_number"]
+            tracking_number = pair["tracking_number"]
+            shop, order = find_order_by_number(order_number)
+            if not order:
+                results.append({
+                    "order_number": order_number, "tracking_number": tracking_number,
+                    "shop": None, "ok": False, "message": "Order not found in any connected store",
+                })
+            else:
+                is_multi_parcel = order_parcel_counts[order_number] > 1
+                ok, message = fulfill_order_with_tracking(
+                    shop, order["id"], tracking_number, pair["carrier"],
+                    limit_to_one_fo=is_multi_parcel,
+                )
+                results.append({
+                    "order_number": order_number, "tracking_number": tracking_number,
+                    "shop": shop, "ok": ok, "message": message,
+                })
+                if not ok:
+                    log_error("fulfill_pdf", f"order=#{order_number} shop={shop} tracking={tracking_number} | {message}")
+
+                # If this order shipped together with another as one combined
+                # parcel, the same tracking number belongs on both — the label
+                # only shows ONE order number, but the physical parcel covers
+                # two Shopify orders, so the second one needs fulfilling here too.
+                if ok:
+                    tags = [t.strip().lower() for t in (order.get("tags") or "").split(",")]
+                    partner_number = find_merge_partner_number(tags)
+                    if partner_number:
+                        partner_order = find_order_by_number_in_shop(shop, partner_number)
+                        if partner_order:
+                            partner_ok, partner_message = fulfill_order_with_tracking(
+                                shop, partner_order["id"], tracking_number, pair["carrier"])
+                            results.append({
+                                "order_number": partner_order["name"], "tracking_number": tracking_number,
+                                "shop": shop, "ok": partner_ok,
+                                "message": f"(merged with #{order_number}) {partner_message}",
+                            })
+                            if not partner_ok:
+                                log_error("fulfill_pdf", f"order=#{partner_number} shop={shop} tracking={tracking_number} "
+                                                          f"| merge-partner fulfillment failed: {partner_message}")
+
+            with FULFILL_JOBS_LOCK:
+                FULFILL_JOBS[job_id]["processed"] = len(results)
+                FULFILL_JOBS[job_id]["results"] = list(results)
+
+        with FULFILL_JOBS_LOCK:
+            FULFILL_JOBS[job_id]["status"] = "done"
+    except Exception as e:
+        log_error("fulfill_pdf_job", f"job_id={job_id} | {e}")
+        with FULFILL_JOBS_LOCK:
+            FULFILL_JOBS[job_id]["status"] = "error"
+            FULFILL_JOBS[job_id]["error"] = str(e)
+
+
 @app.route("/fulfill-pdf", methods=["GET", "POST"])
 @login_required
 def fulfill_pdf():
@@ -1197,95 +1297,85 @@ def fulfill_pdf():
         return jsonify({"error": "No order/tracking pairs found in this PDF — "
                                   "check it's an AusPost label export, not a different document"}), 400
 
-    # Some orders print more than one physical label (multiple parcels for
-    # one Shopify order) — those show up here as the same order_number
-    # against two+ different tracking_numbers. Track the count so each one
-    # only claims a single fulfillment order instead of the first one
-    # grabbing them all. See fulfill_order_with_tracking's limit_to_one_fo.
-    order_parcel_counts = {}
-    for pair in pairs:
-        order_parcel_counts[pair["order_number"]] = order_parcel_counts.get(pair["order_number"], 0) + 1
+    job_id = uuid.uuid4().hex
+    with FULFILL_JOBS_LOCK:
+        FULFILL_JOBS[job_id] = {
+            "status": "running", "total": len(pairs), "processed": 0,
+            "results": [], "created_at": time.time(),
+        }
+    threading.Thread(target=run_fulfillment_job, args=(job_id, pairs), daemon=True).start()
 
-    results = []
-    for pair in pairs:
-        order_number = pair["order_number"]
-        tracking_number = pair["tracking_number"]
-        shop, order = find_order_by_number(order_number)
-        if not order:
-            results.append({
-                "order_number": order_number, "tracking_number": tracking_number,
-                "shop": None, "ok": False, "message": "Order not found in any connected store",
-            })
-            continue
-
-        is_multi_parcel = order_parcel_counts[order_number] > 1
-        ok, message = fulfill_order_with_tracking(
-            shop, order["id"], tracking_number, pair["carrier"],
-            limit_to_one_fo=is_multi_parcel,
-        )
-        results.append({
-            "order_number": order_number, "tracking_number": tracking_number,
-            "shop": shop, "ok": ok, "message": message,
-        })
-        if not ok:
-            log_error("fulfill_pdf", f"order=#{order_number} shop={shop} tracking={tracking_number} | {message}")
-
-        # If this order shipped together with another as one combined
-        # parcel, the same tracking number belongs on both — the label
-        # only shows ONE order number, but the physical parcel covers two
-        # Shopify orders, so the second one needs fulfilling here too.
-        if ok:
-            tags = [t.strip().lower() for t in (order.get("tags") or "").split(",")]
-            partner_number = find_merge_partner_number(tags)
-            if partner_number:
-                partner_order = find_order_by_number_in_shop(shop, partner_number)
-                if partner_order:
-                    partner_ok, partner_message = fulfill_order_with_tracking(
-                        shop, partner_order["id"], tracking_number, pair["carrier"])
-                    results.append({
-                        "order_number": partner_order["name"], "tracking_number": tracking_number,
-                        "shop": shop, "ok": partner_ok,
-                        "message": f"(merged with #{order_number}) {partner_message}",
-                    })
-                    if not partner_ok:
-                        log_error("fulfill_pdf", f"order=#{partner_number} shop={shop} tracking={tracking_number} "
-                                                  f"| merge-partner fulfillment failed: {partner_message}")
-
-    succeeded = sum(1 for r in results if r["ok"])
-    failed = len(results) - succeeded
-
-    row_parts = []
-    for r in results:
-        row_bg = "#1a3d1a" if r["ok"] else "#3d1a1a"
-        status_icon = "✅" if r["ok"] else "❌"
-        store_label = r["shop"] or "—"
-        row_parts.append(
-            f"<tr style='background:{row_bg};'>"
-            f"<td style='padding:8px;'>#{r['order_number']}</td>"
-            f"<td style='padding:8px;'>{r['tracking_number']}</td>"
-            f"<td style='padding:8px;'>{store_label}</td>"
-            f"<td style='padding:8px;'>{status_icon}</td>"
-            f"<td style='padding:8px;'>{r['message']}</td></tr>"
-        )
-    rows = "".join(row_parts)
     return f"""
-    <html><head><title>Fulfill Results</title></head>
+    <html><head><title>Fulfilling...</title></head>
     <body style="background:#111;color:#fff;font-family:sans-serif;padding:30px;">
-    <h2>📦 Fulfillment Results</h2>
-    <p>{succeeded} succeeded, {failed} failed — {len(results)} parcels parsed from the PDF.</p>
+    <h2>📦 Fulfilling {len(pairs)} parcel(s)...</h2>
+    <p id="progress-text" style="color:#aaa;">Starting — this runs in the background now, so it's
+    safe to leave this tab open even on a big batch. Large batches can take a few minutes,
+    especially if Shopify is rate-limiting.</p>
+    <div style="background:#222;border-radius:6px;height:20px;overflow:hidden;margin-bottom:20px;">
+      <div id="progress-bar" style="background:#2ecc71;height:100%;width:0%;transition:width 0.3s;"></div>
+    </div>
     <table style="width:100%;border-collapse:collapse;">
       <tr style="text-align:left;color:#888;">
         <th style="padding:8px;">Order</th><th style="padding:8px;">Tracking</th>
         <th style="padding:8px;">Store</th><th style="padding:8px;">Status</th><th style="padding:8px;">Detail</th>
       </tr>
-      {rows}
+      <tbody id="results-body"></tbody>
     </table>
+    <script>
+    const jobId = "{job_id}";
+    const total = {len(pairs)};
+    async function poll() {{
+      let data;
+      try {{
+        const r = await fetch(`/fulfill-pdf/status/${{jobId}}`);
+        data = await r.json();
+      }} catch (e) {{
+        setTimeout(poll, 3000);
+        return;
+      }}
+      document.getElementById('progress-bar').style.width = (data.processed / total * 100) + '%';
+      document.getElementById('results-body').innerHTML = data.results_html;
+      if (data.status === 'done') {{
+        const succeeded = data.results.filter(r => r.ok).length;
+        const failed = data.results.length - succeeded;
+        document.getElementById('progress-text').innerHTML =
+          `Done — ${{succeeded}} succeeded, ${{failed}} failed, ${{data.results.length}} parcel(s) processed.`;
+      }} else if (data.status === 'error') {{
+        document.getElementById('progress-text').innerHTML =
+          `⚠️ Job hit an unexpected error partway through (${{data.processed}}/${{total}} done before it `
+          + `failed): ${{data.error}}. Check /logs — the parcels already processed above did complete.`;
+      }} else {{
+        document.getElementById('progress-text').innerText = `Processing ${{data.processed}} / ${{total}}...`;
+        setTimeout(poll, 2000);
+      }}
+    }}
+    poll();
+    </script>
     <p style="margin-top:20px;">
       <a href="/fulfill-pdf" style="color:#2ecc71;">Upload another PDF</a> &nbsp;|&nbsp;
       <a href="/scan" style="color:#888;">Back to scan</a>
     </p>
     </body></html>
     """
+
+
+@app.route("/fulfill-pdf/status/<job_id>")
+@login_required
+def fulfill_pdf_status(job_id):
+    with FULFILL_JOBS_LOCK:
+        job = FULFILL_JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown or expired job_id — the server may have restarted "
+                                  "since this job was started"}), 404
+    return jsonify({
+        "status": job["status"],
+        "processed": job["processed"],
+        "total": job["total"],
+        "results": job["results"],
+        "results_html": render_fulfill_results_table(job["results"]),
+        "error": job.get("error"),
+    })
 
 
 AUTO_CONFIRM_KEYWORDS = ["package protection", "free return", "free returns"]
