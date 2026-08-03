@@ -943,6 +943,100 @@ def api_export_batch():
     return send_file(tmp_path, as_attachment=True, download_name="auspost_export.csv", mimetype="text/csv")
 
 
+def find_crashed_batch_candidates(since_hours=24):
+    """Recovery helper for when /api/export_batch tags orders as
+    auspost-exported (mark_orders_exported) but then crashes — e.g. a
+    gunicorn worker timeout partway through the tagging loop, or during CSV
+    generation — before it reaches save_last_batch_export. Those orders are
+    then invisible to the next normal export (fetch_packed_ready_orders
+    skips anything already tagged auspost-exported), while
+    /api/reexport_last_batch keeps serving the OLDER batch that WAS saved
+    successfully, since the crashed run never overwrote that record.
+
+    Finds orders that match this exact signature: still unfulfilled/partial
+    (never actually shipped — the crash happened before the label CSV made
+    it out), carrying BOTH packed-ready and auspost-exported tags, updated
+    within the last `since_hours` hours, and NOT part of the last
+    successfully-recorded batch — that last exclusion is what stops a
+    genuinely older stuck order from being swept up by mistake, since a
+    normal, completed export also leaves both tags on an order permanently
+    (nothing here ever strips packed-ready)."""
+    cutoff = time.time() - since_hours * 3600
+    last_batch = load_last_batch_export()
+    known_good_ids = {(o["shop"], o["order_id"]) for o in (last_batch or {}).get("orders", [])}
+
+    candidates = []
+    for shop in all_connected_shops():
+        unfulfilled = shopify_get_all_pages(shop, "orders.json", {
+            "status": "any", "fulfillment_status": "unfulfilled", "limit": 250,
+        }, "orders")
+        partial = shopify_get_all_pages(shop, "orders.json", {
+            "status": "any", "fulfillment_status": "partial", "limit": 250,
+        }, "orders")
+        seen_ids = set()
+        for order in unfulfilled + partial:
+            if order["id"] in seen_ids:
+                continue
+            seen_ids.add(order["id"])
+            tags = [t.strip().lower() for t in (order.get("tags") or "").split(",")]
+            if "packed-ready" not in tags or "auspost-exported" not in tags:
+                continue
+            if (shop, order["id"]) in known_good_ids:
+                continue
+            updated_at = order.get("updated_at", "")
+            try:
+                updated_ts = time.mktime(time.strptime(updated_at[:19], "%Y-%m-%dT%H:%M:%S"))
+            except (ValueError, TypeError):
+                updated_ts = 0
+            if updated_ts < cutoff:
+                continue
+            candidates.append({
+                "shop": shop, "order_id": order["id"],
+                "order_number": order["name"], "updated_at": updated_at,
+            })
+    return candidates
+
+
+@app.route("/api/find_crashed_batch_orders")
+@login_required
+def api_find_crashed_batch_orders():
+    """Read-only — lists the candidate orders without changing anything.
+    Check the count and order numbers look right before calling
+    /api/recover_crashed_batch. Widen ?since_hours=48 (etc.) if the crash
+    was further back than 24h and orders are missing from the list."""
+    since_hours = float(request.args.get("since_hours", 24))
+    candidates = find_crashed_batch_candidates(since_hours)
+    return jsonify({
+        "count": len(candidates),
+        "orders": candidates,
+        "note": "Unfulfilled orders tagged auspost-exported but NOT in the last successfully-saved "
+                "batch record — almost certainly the crashed batch. Call /api/recover_crashed_batch "
+                "with the same since_hours to untag them, then run /api/export_batch again.",
+    })
+
+
+@app.route("/api/recover_crashed_batch")
+@login_required
+def api_recover_crashed_batch():
+    """Strips the stale auspost-exported tag off exactly the orders
+    find_crashed_batch_candidates identifies, so they show up again in the
+    next normal /api/export_batch run. Doesn't export anything itself —
+    run /api/export_batch straight after this."""
+    since_hours = float(request.args.get("since_hours", 24))
+    candidates = find_crashed_batch_candidates(since_hours)
+    if not candidates:
+        return jsonify({"error": "No candidate orders found — nothing to recover. "
+                                  "Try a larger since_hours if the crash was more than 24h ago."}), 404
+    for c in candidates:
+        unmark_order_exported(c["shop"], c["order_id"])
+    return jsonify({
+        "recovered_count": len(candidates),
+        "orders": candidates,
+        "note": "auspost-exported tag removed from these orders. Run /api/export_batch now to get a "
+                "clean CSV covering them.",
+    })
+
+
 @app.route("/api/export_single")
 @login_required
 def api_export_single():
