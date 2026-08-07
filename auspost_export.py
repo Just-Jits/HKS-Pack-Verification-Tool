@@ -29,15 +29,21 @@ HS_FALLBACK = "611030"          # Rash Guard — used if a product matches no bu
 
 # Three separate dimension profiles now, not one flat default for everyone:
 #
-# 1. Domestic default (small/XS satchel) — every domestic order unless the
-#    single-item override below applies.
+# 1. Domestic default — AusPost Small Satchel (their own preset-size
+#    product, not our own packaging) unless the single-item override below
+#    applies. Dimensions are set below but likely ignored by AusPost for a
+#    named satchel product (it has its own fixed preset size in their
+#    system) — left in place regardless since it's harmless either way and
+#    some downstream tooling/reports may still read these columns.
+DOMESTIC_SATCHEL_PACKAGING_CODE = "AP_SATCHEL_S"
 DOMESTIC_SATCHEL_LENGTH_CM = 30
 DOMESTIC_SATCHEL_WIDTH_CM = 10
 DOMESTIC_SATCHEL_HEIGHT_CM = 5
 #
 # 2. Domestic, confirmed single tiny item (xs-satchel-ok tag) — switches
-#    packaging to Own Packaging with these smaller dimensions instead of
-#    the AusPost satchel product.
+#    packaging to AusPost's Extra Small Satchel product instead of the
+#    default Small Satchel.
+DOMESTIC_XS_SATCHEL_PACKAGING_CODE = "AP_SATCHEL_XS"
 DOMESTIC_XS_OWN_LENGTH_CM = 20
 DOMESTIC_XS_OWN_WIDTH_CM = 20
 DOMESTIC_XS_OWN_HEIGHT_CM = 2
@@ -246,15 +252,14 @@ def build_row(order):
         item_length, item_width, item_height = INTL_LENGTH_CM, INTL_WIDTH_CM, INTL_HEIGHT_CM
     elif is_xs:
         # Packer confirmed this is a single item under 250g that fits a tiny
-        # satchel — switch off the AusPost satchel product entirely and use
-        # Own Packaging at the smaller confirmed dimensions.
-        packaging = "OWN_PACKAGING"
+        # satchel — use AusPost's Extra Small Satchel product instead of
+        # the default Small Satchel.
+        packaging = DOMESTIC_XS_SATCHEL_PACKAGING_CODE
         delivery_service = "EXP" if is_express else "PP"
         item_length, item_width, item_height = DOMESTIC_XS_OWN_LENGTH_CM, DOMESTIC_XS_OWN_WIDTH_CM, DOMESTIC_XS_OWN_HEIGHT_CM
     else:
-        # Domestic default — this is OUR OWN packaging/satchels, not
-        # AusPost's own "Small Satchel" product — at the standard dimensions.
-        packaging = "OWN_PACKAGING"
+        # Domestic default — AusPost's own Small Satchel product.
+        packaging = DOMESTIC_SATCHEL_PACKAGING_CODE
         delivery_service = "EXP" if is_express else "PP"
         item_length, item_width, item_height = DOMESTIC_SATCHEL_LENGTH_CM, DOMESTIC_SATCHEL_WIDTH_CM, DOMESTIC_SATCHEL_HEIGHT_CM
 
