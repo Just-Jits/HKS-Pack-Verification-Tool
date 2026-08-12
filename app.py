@@ -692,8 +692,80 @@ def extract_export_line_items(order):
             "title": li["title"],
             "quantity": current_qty,
             "price": float(li.get("price", 0)),
+            "sku": li.get("sku", ""),
         })
     return line_items
+
+
+def lookup_hs_codes_by_skus(shop, skus):
+    """Batch-fetches the REAL harmonizedSystemCode Shopify has recorded for
+    each SKU (Product > Inventory > HS Code) — this is the ground-truth
+    source auspost_export.py's HS lookup table matches against, replacing
+    the old approach of guessing a code from the product title.
+
+    Uses Shopify's OR'd sku: search syntax to batch up to 50 SKUs per
+    GraphQL call rather than one call per line item, so a 20-order export
+    batch costs a couple of API calls, not dozens.
+
+    Returns {sku: harmonized_system_code_or_None}."""
+    token = get_token_for_shop(shop)
+    skus = [s for s in dict.fromkeys(skus) if s]  # dedupe, drop blanks, keep order
+    if not token or not skus:
+        return {}
+
+    url = f"https://{shop}/admin/api/{API_VERSION}/graphql.json"
+    query = """
+    query getHsCodesBySku($q: String!) {
+      productVariants(first: 50, query: $q) {
+        edges { node { sku inventoryItem { harmonizedSystemCode } } }
+      }
+    }
+    """
+    result = {}
+    BATCH_SIZE = 50
+    for i in range(0, len(skus), BATCH_SIZE):
+        batch = skus[i:i + BATCH_SIZE]
+        safe_skus = [s.replace('"', '\\"') for s in batch]
+        search_q = " OR ".join(f'sku:"{s}"' for s in safe_skus)
+        try:
+            r = shopify_request_with_retry(
+                "POST", url,
+                headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
+                json={"query": query, "variables": {"q": search_q}},
+                timeout=20,
+            )
+            if r.status_code != 200:
+                log_error("lookup_hs_codes_by_skus", f"shop={shop} status={r.status_code}: {r.text[:300]}")
+                continue
+            edges = r.json().get("data", {}).get("productVariants", {}).get("edges", [])
+            for e in edges:
+                node = e["node"]
+                sku = node.get("sku")
+                code = (node.get("inventoryItem") or {}).get("harmonizedSystemCode")
+                if sku:
+                    result[sku] = code
+        except requests.exceptions.RequestException as e:
+            log_error("lookup_hs_codes_by_skus", f"shop={shop} | {e}")
+    return result
+
+
+def attach_hs_codes(orders):
+    """Stamps each line item's real Shopify HS code onto it as 'hs_code'
+    right before export, one batched lookup per shop (orders in a single
+    export batch can span multiple stores). Must be called on every order
+    list right before export_orders_to_xlsx — without this, line items
+    have no 'hs_code' key and auspost_export.py's lookup table has
+    nothing to match against."""
+    orders_by_shop = {}
+    for order in orders:
+        orders_by_shop.setdefault(order["shop"], []).append(order)
+
+    for shop, shop_orders in orders_by_shop.items():
+        skus = [li.get("sku", "") for o in shop_orders for li in o["line_items"]]
+        hs_by_sku = lookup_hs_codes_by_skus(shop, skus)
+        for o in shop_orders:
+            for li in o["line_items"]:
+                li["hs_code"] = hs_by_sku.get(li.get("sku"))
 
 
 def process_order_for_export(shop, order, merge_partner_order=None):
@@ -932,6 +1004,7 @@ def api_export_batch():
         return jsonify({"error": "No packed-ready orders found to export"}), 404
 
     tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_export_{int(time.time())}.csv")
+    attach_hs_codes(all_orders)
     export_orders_to_xlsx(all_orders, tmp_path)
 
     by_shop = {}
@@ -1052,6 +1125,7 @@ def api_export_single():
         return jsonify({"error": "Could not load that order"}), 404
 
     tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_single_{order_id}_{int(time.time())}.csv")
+    attach_hs_codes(orders)
     export_orders_to_xlsx(orders, tmp_path)
     mark_orders_exported(shop, [order_id])
 
@@ -1095,6 +1169,7 @@ def api_reexport_orders():
                          "not_found": not_found}), 404
 
     tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_reexport_{int(time.time())}.csv")
+    attach_hs_codes(all_orders)
     export_orders_to_xlsx(all_orders, tmp_path)
 
     by_shop = {}
@@ -1143,6 +1218,7 @@ def api_reexport_last_batch():
                          "not_found": not_found}), 404
 
     tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_reexport_last_batch_{int(time.time())}.csv")
+    attach_hs_codes(all_orders)
     export_orders_to_xlsx(all_orders, tmp_path)
 
     by_shop = {}

@@ -10,6 +10,19 @@ generated .xlsx file.
 import re
 import csv
 
+try:
+    import pykakasi
+    _kks = pykakasi.kakasi()
+    HAVE_PYKAKASI = True
+except ImportError:
+    HAVE_PYKAKASI = False
+
+try:
+    from unidecode import unidecode
+    HAVE_UNIDECODE = True
+except ImportError:
+    HAVE_UNIDECODE = False
+
 SEND_FROM = {
     "name": "Just Jits",
     "business_name": "Just Jits",
@@ -25,7 +38,6 @@ SEND_FROM = {
 
 TOTAL_WEIGHT_KG = 0.2          # flat default per parcel, single combined customs line
 VALUE_PCT = 0.10                # declared customs value = 10% of retail (a 90% reduction)
-HS_FALLBACK = "611030"          # Rash Guard — used if a product matches no bucket
 
 # Three separate dimension profiles now, not one flat default for everyone:
 #
@@ -58,16 +70,59 @@ INTL_HEIGHT_CM = 5
 # AusPost only accepts: RETURN or ABANDONED
 CANNOT_BE_DELIVERED = "RETURN"
 
-# Bucket name -> (keywords to match in product title, HS code for that bucket)
-BUCKETS = [
-    ("Gi", ["gi", "kimono", "uniform"], "611430"),
-    ("Boxing/protective gear", ["boxing glove", "shin pad", "shin guard", "glove",
-                                  "protective", "headgear", "head gear", "mouthguard",
-                                  "mouth guard"], "950699"),
-    ("Rash guard", ["rash guard", "rashguard", "shorts", "spats", "legging",
-                     "no-gi", "no gi", "belt", "sock", "hoodie", "t-shirt", "tshirt"],
-     "611030"),
-]
+# HS code lookup — keyed on the FIRST 6 DIGITS of whatever's actually
+# assigned to the product in Shopify (Product > Inventory > HS Code), NOT
+# guessed from the product title. Confirmed with Ganesh 2026-08 after
+# finding Shopify's own HS codes were mostly missing or defaulted to the
+# gi code across the whole catalog — this table only supplies the correct
+# DESCRIPTION and US 10-digit HTSUS extension for a code Shopify already
+# has recorded; it never invents a code that isn't there.
+#
+# us_hts10: the US import HTSUS code (administered by USITC) — required in
+# full for any parcel where the destination country is the US. Different
+# from a generic "10-digit HS code": it's specifically the US import
+# extension, not Schedule B (US export) or any other country's extension.
+HS_CODE_TABLE = {
+    "620322": {"description": "Cotton martial arts uniform", "us_hts10": "6203221000"},
+    "611430": {"description": "Cotton martial arts uniform", "us_hts10": "6203221000"},  # confirmed same as 620322 (Ganesh, 2026-08)
+    "611030": {"description": "Synthetic knitted rash guard", "us_hts10": "6110303053"},
+    "420321": {"description": "Leather sports gloves", "us_hts10": "4203218060"},
+    "950699": {"description": "Synthetic sports/protective equipment", "us_hts10": "9506996080"},
+    "611231": {"description": "Synthetic training shorts, men's", "us_hts10": "6112310010"},
+    "611241": {"description": "Synthetic training shorts, women's", "us_hts10": "6112410010"},
+    "640220": {"description": "Footwear thongs/sandals", "us_hts10": "6402200000"},
+}
+
+
+def hs6_key(raw_code):
+    """Normalizes whatever's stored in Shopify's HS code field (may come
+    with or without dots, may be 6 or 8+ digits depending on how it was
+    entered) down to the plain 6-digit HS root for table lookup."""
+    digits = re.sub(r"\D", "", raw_code or "")
+    return digits[:6]
+
+
+def resolve_hs_entry(raw_code, title):
+    """Looks up the real Shopify-assigned HS code against our table. If the
+    code isn't in the table (new product type we haven't catalogued yet, or
+    Shopify has no code set at all), this does NOT silently guess — it
+    returns a description that visibly flags the row for manual review, so
+    a bad customs declaration can't slip out quietly the way the old
+    title-keyword guesser did."""
+    hs6 = hs6_key(raw_code)
+    entry = HS_CODE_TABLE.get(hs6)
+    if entry:
+        return {
+            "hs6": hs6,
+            "description": entry["description"],
+            "us_hts10": entry["us_hts10"],
+        }
+    flagged_desc = f"REVIEW HS CODE - {title}"[:40]
+    return {
+        "hs6": hs6 or "MISSING",
+        "description": flagged_desc,
+        "us_hts10": None,
+    }
 
 HEADERS = [
     "Send From Name", "Send From Business Name", "Send From Address Line 1",
@@ -153,13 +208,100 @@ def normalize_au_phone(phone):
     return phone  # doesn't look like an AU number — leave as-is
 
 
-def bucket_for(title):
-    title_lower = title.lower()
-    for bucket_name, keywords, hs_code in BUCKETS:
-        for kw in keywords:
-            if kw in title_lower:
-                return bucket_name, hs_code
-    return "Rash guard", HS_FALLBACK  # fallback bucket, per Ganesh's instruction
+# Unicode blocks used to detect non-Latin script. Deliberately narrow —
+# only the scripts Ganesh actually flagged (Japanese, Hebrew) trigger this,
+# so e.g. accented European names pass through untouched.
+JAPANESE_RANGES = [
+    (0x3040, 0x309F),  # Hiragana
+    (0x30A0, 0x30FF),  # Katakana
+    (0x4E00, 0x9FFF),  # Kanji (CJK Unified Ideographs)
+]
+HEBREW_RANGE = (0x0590, 0x05FF)
+
+
+def _contains_range(text, ranges):
+    return any(any(lo <= ord(ch) <= hi for lo, hi in ranges) for ch in text)
+
+
+def _is_japanese(text):
+    return _contains_range(text, JAPANESE_RANGES)
+
+
+def _is_hebrew(text):
+    return _contains_range(text, [HEBREW_RANGE])
+
+
+def transliterate_if_needed(text):
+    """AusPost requires at least one Latin character in name/suburb/city
+    fields. Rather than a placeholder character, this does a real
+    best-effort ROMANIZATION (sounds-like, not translation) and prepends
+    it ahead of the original script, e.g. '田中' -> 'Tanaka 田中'.
+
+    Only touches text containing Japanese or Hebrew characters — anything
+    else (including already-Latin text) passes through unchanged. Only
+    ever called on name/city/suburb fields, per Ganesh's instruction —
+    NEVER on street address lines, which stay exactly as the customer
+    entered them to avoid any risk of mangling a real address."""
+    if not text:
+        return text
+
+    if _is_japanese(text):
+        if HAVE_PYKAKASI:
+            try:
+                romanized = "".join(item["hepburn"] for item in _kks.convert(text))
+                romanized = romanized.strip().title()
+                if romanized:
+                    return f"{romanized} {text}"
+            except Exception:
+                pass  # fall through to unidecode/unchanged below
+        if HAVE_UNIDECODE:
+            romanized = unidecode(text).strip()
+            if romanized:
+                return f"{romanized} {text}"
+        return text  # neither library available — leave unchanged rather than guess
+
+    if _is_hebrew(text):
+        if HAVE_UNIDECODE:
+            romanized = unidecode(text).strip()
+            if romanized:
+                return f"{romanized} {text}"
+        return text
+
+    return text
+
+
+def split_address_line1(address1, existing_line2=""):
+    """AusPost hard-caps 'Deliver To Address Line 1' at 40 characters. If
+    Shopify's address1 is longer, cut it at the last space at or before
+    character 40 (never mid-word) and push the overflow onto the FRONT of
+    address line 2 — ahead of whatever was already there (e.g. a unit
+    number the customer put in address2), so nothing gets silently dropped.
+
+    Returns (line1, line2). If line2 itself still exceeds 40 chars after
+    combining (rare — needs a very long address1 AND a long existing
+    line2), the excess is trimmed and returned separately as `overflow`
+    so the caller can surface it in Delivery Instructions instead of
+    losing it outright."""
+    address1 = (address1 or "").strip()
+    existing_line2 = (existing_line2 or "").strip()
+
+    if len(address1) <= 40:
+        return address1, existing_line2, ""
+
+    cut = address1.rfind(" ", 0, 40)
+    if cut <= 0:  # no space in the first 40 chars (one long word) — hard cut
+        cut = 40
+    line1 = address1[:cut].rstrip()
+    carried_over = address1[cut:].strip()
+
+    line2 = f"{carried_over} {existing_line2}".strip() if existing_line2 else carried_over
+
+    if len(line2) <= 40:
+        return line1, line2, ""
+
+    # Still too long even combined — keep line2 at 40 and surface the rest
+    # separately rather than silently truncating it away.
+    return line1, line2[:40].rstrip(), line2[40:].strip()
 
 
 def round_to_90_cents(value):
@@ -191,31 +333,38 @@ def group_line_items(line_items):
     simplification for a single-line declaration, not a precise per-item
     customs breakdown.
     """
-    groups = {}  # bucket_name -> {qty, total_retail_value, hs_code}
+    groups = {}  # hs6 (or 'MISSING') -> {qty, value, description, us_hts10}
     for li in line_items:
-        bucket_name, hs_code = bucket_for(li["title"])
-        if bucket_name not in groups:
-            groups[bucket_name] = {"qty": 0, "value": 0.0, "hs_code": hs_code}
-        groups[bucket_name]["qty"] += li["quantity"]
-        groups[bucket_name]["value"] += li.get("price", 0) * li["quantity"]
+        entry = resolve_hs_entry(li.get("hs_code"), li["title"])
+        key = entry["hs6"]
+        if key not in groups:
+            groups[key] = {
+                "qty": 0, "value": 0.0,
+                "description": entry["description"],
+                "us_hts10": entry["us_hts10"],
+            }
+        groups[key]["qty"] += li["quantity"]
+        groups[key]["value"] += li.get("price", 0) * li["quantity"]
 
     if not groups:
         return []
 
     total_retail_value = sum(g["value"] for g in groups.values())
 
-    # Pick the highest-value category as the representative description/HS code
-    dominant_bucket_name, dominant = max(groups.items(), key=lambda kv: kv[1]["value"])
+    # Pick the highest-value HS code as the representative description/code
+    # for this single combined customs line.
+    dominant_key, dominant = max(groups.items(), key=lambda kv: kv[1]["value"])
 
     declared_value = round_to_90_cents(total_retail_value * VALUE_PCT)
 
     return [{
-        "description": dominant_bucket_name[:40],
+        "description": dominant["description"][:40],
         "weight": TOTAL_WEIGHT_KG,
         "value": declared_value,
         "quantity": 1,
         "country_of_origin": "AU",
-        "hs_tariff": dominant["hs_code"],
+        "hs_tariff": dominant_key,        # international default: 6-digit HS
+        "us_hts10": dominant["us_hts10"], # used instead, only when destination is US
     }]
 
 
@@ -285,14 +434,26 @@ def build_row(order):
     # country code and shouldn't have 61 prepended on top of it.
     deliver_to_phone = normalize_au_phone(addr.get("phone", "")) if not is_intl else addr.get("phone", "")
 
+    # 40-char address line 1 cap — split cleanly rather than truncating.
+    address_line_1, address_line_2, address_overflow = split_address_line1(
+        addr.get("address1", ""), addr.get("address2", "")
+    )
+
+    # Non-Latin name/city — AusPost requires at least one Latin character.
+    # Only name and city are touched (never street address lines).
+    deliver_to_name = transliterate_if_needed(addr.get("name", ""))
+    deliver_to_city = transliterate_if_needed(addr.get("city", ""))
+
+    destination_country_code = addr.get("country_code", "AU") if is_intl else "AU"
+
     row = [
         SEND_FROM["name"], SEND_FROM["business_name"], SEND_FROM["address_line_1"],
         SEND_FROM["address_line_2"], SEND_FROM["address_line_3"], SEND_FROM["suburb"],
         SEND_FROM["state"], SEND_FROM["postcode"], SEND_FROM["phone"], SEND_FROM["email"],
-        addr.get("name", ""), "", business_name, "",
-        addr.get("country_code", "AU") if is_intl else "AU",
-        addr.get("address1", ""), addr.get("address2", ""), "",
-        addr.get("city", ""), addr.get("province_code", "") if not is_intl else addr.get("province", ""),
+        deliver_to_name, "", business_name, "",
+        destination_country_code,
+        address_line_1, address_line_2, "",
+        deliver_to_city, addr.get("province_code", "") if not is_intl else addr.get("province", ""),
         addr.get("zip", ""), deliver_to_phone, order.get("email", ""),
         packaging, delivery_service, "Apparel",
         item_length, item_width, item_height,
@@ -309,15 +470,28 @@ def build_row(order):
     for i in range(4):
         if i < len(bucket_rows):
             b = bucket_rows[i]
+            # US shipments need the full 10-digit HTSUS code, not the
+            # 6-digit international HS root. Falls back to the 6-digit
+            # code if we don't have a US 10-digit match on file for this
+            # HS code (also true for anything flagged MISSING/REVIEW).
+            if is_intl and destination_country_code == "US" and b.get("us_hts10"):
+                hs_tariff_out = b["us_hts10"]
+            else:
+                hs_tariff_out = b["hs_tariff"] if is_intl else ""
             row += [b["description"], b["weight"], b["value"], b["quantity"],
                     b["country_of_origin"] if is_intl else "",
-                    b["hs_tariff"] if is_intl else ""]
+                    hs_tariff_out]
         else:
             row += ["", "", "", "", "", ""]
 
     landed_costs_payer = LANDED_COSTS_PAYER if is_intl else ""
 
-    delivery_instructions = f"Business name (full): {company_overflow_note}" if company_overflow_note else ""
+    instruction_parts = []
+    if company_overflow_note:
+        instruction_parts.append(f"Business name (full): {company_overflow_note}")
+    if address_overflow:
+        instruction_parts.append(f"Address (cont.): {address_overflow}")
+    delivery_instructions = " | ".join(instruction_parts)
 
     row += ["YES", SEND_FROM["email"], f"Order {order['order_number']}", delivery_instructions, "",
             landed_costs_payer, "", "", "", "", ""]
