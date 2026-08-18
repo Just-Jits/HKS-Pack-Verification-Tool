@@ -493,8 +493,16 @@ def build_row(order):
         instruction_parts.append(f"Address (cont.): {address_overflow}")
     delivery_instructions = " | ".join(instruction_parts)
 
+    # Personal customs code / tax ID — South Korea's Personal Customs
+    # Code, Brazil's CPF/CNPJ, China's shipping credential, etc. Shopify
+    # Markets decides which destination countries require this and
+    # collects it at checkout automatically (order's SHIPPING-purpose
+    # localizationExtensions); we just relay whatever value app.py's
+    # attach_customs_codes() found. Only meaningful for international.
+    importer_reference = order.get("importer_reference", "") if is_intl else ""
+
     row += ["YES", SEND_FROM["email"], f"Order {order['order_number']}", delivery_instructions, "",
-            landed_costs_payer, "", "", "", "", ""]
+            landed_costs_payer, "", importer_reference, "", "", ""]
 
     return row
 
