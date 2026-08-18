@@ -19,6 +19,17 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-me-in-railway-env")
 CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID")  # fallback/default app
 CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET")  # fallback/default app
 APP_URL = os.environ["APP_URL"]  # e.g. https://pack-verify-tool-production.up.railway.app
+
+# JustJits is the master inventory store — every SKU's real HS Code
+# (Product > Inventory > HS Code) is maintained there. Sinkro syncs stock
+# and pricing to the brand stores (Hooks, Atlas, Kureiji, True Illusion)
+# but does NOT sync the HS Code inventory field, so an order placed on a
+# brand store has no HS code on its own copy of the product. HS code
+# lookups must always go against this store, never the order's own shop,
+# or every brand-store order falls through to "REVIEW HS CODE" (confirmed
+# with Ganesh 2026-08 after this caused most international exports to come
+# back flagged for manual review).
+MASTER_INVENTORY_SHOP = os.environ.get("MASTER_INVENTORY_SHOP", "justjits.myshopify.com")
 SCOPES = ",".join([
     "read_orders", "write_orders",
     "read_products", "write_products",
@@ -751,21 +762,71 @@ def lookup_hs_codes_by_skus(shop, skus):
 
 def attach_hs_codes(orders):
     """Stamps each line item's real Shopify HS code onto it as 'hs_code'
-    right before export, one batched lookup per shop (orders in a single
-    export batch can span multiple stores). Must be called on every order
-    list right before export_orders_to_xlsx — without this, line items
-    have no 'hs_code' key and auspost_export.py's lookup table has
-    nothing to match against."""
+    right before export. Always looked up against MASTER_INVENTORY_SHOP
+    (JustJits) regardless of which store the order itself came from —
+    SKUs are shared across all brand stores, but only JustJits actually
+    has the HS Code field populated (see MASTER_INVENTORY_SHOP comment).
+    Must be called on every order list right before export_orders_to_xlsx
+    — without this, line items have no 'hs_code' key and
+    auspost_export.py's lookup table has nothing to match against."""
+    skus = [li.get("sku", "") for o in orders for li in o["line_items"]]
+    hs_by_sku = lookup_hs_codes_by_skus(MASTER_INVENTORY_SHOP, skus)
+    for o in orders:
+        for li in o["line_items"]:
+            li["hs_code"] = hs_by_sku.get(li.get("sku"))
+
+
+def attach_customs_codes(orders):
+    """Stamps each order with 'importer_reference' — the value of any
+    SHIPPING-purpose localization extension Shopify captured at checkout
+    (e.g. South Korea's Personal Customs Code, Brazil's CPF/CNPJ, China's
+    shipping credential). Shopify Markets decides which countries need
+    this and shows/requires the field automatically at checkout — we
+    don't maintain a country list here, we just relay whatever value it
+    captured through to AusPost's "Importer's Reference Number" column.
+    Must be called (like attach_hs_codes) right before export_orders_to_xlsx."""
     orders_by_shop = {}
     for order in orders:
         orders_by_shop.setdefault(order["shop"], []).append(order)
 
+    BATCH_SIZE = 50
     for shop, shop_orders in orders_by_shop.items():
-        skus = [li.get("sku", "") for o in shop_orders for li in o["line_items"]]
-        hs_by_sku = lookup_hs_codes_by_skus(shop, skus)
-        for o in shop_orders:
-            for li in o["line_items"]:
-                li["hs_code"] = hs_by_sku.get(li.get("sku"))
+        token = get_token_for_shop(shop)
+        if not token:
+            for o in shop_orders:
+                o["importer_reference"] = ""
+            continue
+        url = f"https://{shop}/admin/api/{API_VERSION}/graphql.json"
+        for i in range(0, len(shop_orders), BATCH_SIZE):
+            batch = shop_orders[i:i + BATCH_SIZE]
+            fields = [
+                f'o{idx}: order(id: "gid://shopify/Order/{o["order_id"]}") '
+                f'{{ localizationExtensions(first: 5) {{ edges {{ node {{ purpose value }} }} }} }}'
+                for idx, o in enumerate(batch)
+            ]
+            query = "query { " + " ".join(fields) + " }"
+            try:
+                r = shopify_request_with_retry(
+                    "POST", url,
+                    headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
+                    json={"query": query},
+                    timeout=20,
+                )
+                if r.status_code != 200:
+                    log_error("attach_customs_codes", f"shop={shop} status={r.status_code}: {r.text[:300]}")
+                    for o in batch:
+                        o["importer_reference"] = ""
+                    continue
+                data = r.json().get("data") or {}
+                for idx, o in enumerate(batch):
+                    node = data.get(f"o{idx}") or {}
+                    edges = (node.get("localizationExtensions") or {}).get("edges", [])
+                    shipping_values = [e["node"]["value"] for e in edges if e["node"].get("purpose") == "SHIPPING"]
+                    o["importer_reference"] = shipping_values[0] if shipping_values else ""
+            except requests.exceptions.RequestException as e:
+                log_error("attach_customs_codes", f"shop={shop} | {e}")
+                for o in batch:
+                    o["importer_reference"] = ""
 
 
 def process_order_for_export(shop, order, merge_partner_order=None):
@@ -1005,6 +1066,7 @@ def api_export_batch():
 
     tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_export_{int(time.time())}.csv")
     attach_hs_codes(all_orders)
+    attach_customs_codes(all_orders)
     export_orders_to_xlsx(all_orders, tmp_path)
 
     by_shop = {}
@@ -1126,6 +1188,7 @@ def api_export_single():
 
     tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_single_{order_id}_{int(time.time())}.csv")
     attach_hs_codes(orders)
+    attach_customs_codes(orders)
     export_orders_to_xlsx(orders, tmp_path)
     mark_orders_exported(shop, [order_id])
 
@@ -1170,6 +1233,7 @@ def api_reexport_orders():
 
     tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_reexport_{int(time.time())}.csv")
     attach_hs_codes(all_orders)
+    attach_customs_codes(all_orders)
     export_orders_to_xlsx(all_orders, tmp_path)
 
     by_shop = {}
@@ -1219,6 +1283,7 @@ def api_reexport_last_batch():
 
     tmp_path = os.path.join(tempfile.gettempdir(), f"auspost_reexport_last_batch_{int(time.time())}.csv")
     attach_hs_codes(all_orders)
+    attach_customs_codes(all_orders)
     export_orders_to_xlsx(all_orders, tmp_path)
 
     by_shop = {}
