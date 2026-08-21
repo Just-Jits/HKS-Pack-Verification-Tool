@@ -129,10 +129,13 @@ def hs6_key(raw_code):
 def resolve_hs_entry(raw_code, title):
     """Looks up the real Shopify-assigned HS code against our table. If the
     code isn't in the table (new product type we haven't catalogued yet, or
-    Shopify has no code set at all), this does NOT silently guess — it
-    returns a description that visibly flags the row for manual review, so
-    a bad customs declaration can't slip out quietly the way the old
-    title-keyword guesser did."""
+    Shopify has no code set at all), this defaults to the rashguard entry
+    (611030) rather than flagging for manual review — explicit instruction
+    from Ganesh 2026-08 after the REVIEW flag turned out to cause more
+    packing-desk friction than it prevented. Every default is still logged
+    server-side (see log_error call below) so there's a record of which
+    orders got a best-guess code, even though the exported CSV itself now
+    shows a normal-looking line rather than a visible flag."""
     hs6 = hs6_key(raw_code)
     entry = HS_CODE_TABLE.get(hs6)
     if entry:
@@ -141,11 +144,13 @@ def resolve_hs_entry(raw_code, title):
             "description": entry["description"],
             "us_hts10": entry["us_hts10"],
         }
-    flagged_desc = f"REVIEW HS CODE - {title}"[:40]
+    print(f"[resolve_hs_entry] defaulted to rashguard (611030) — no table match for "
+          f"hs6={hs6!r} raw_code={raw_code!r} title={title!r}")
+    fallback = HS_CODE_TABLE["611030"]
     return {
-        "hs6": hs6 or "MISSING",
-        "description": flagged_desc,
-        "us_hts10": None,
+        "hs6": "611030",
+        "description": fallback["description"],
+        "us_hts10": fallback["us_hts10"],
     }
 
 HEADERS = [

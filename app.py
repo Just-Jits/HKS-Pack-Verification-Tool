@@ -685,6 +685,15 @@ def extract_export_line_items(order):
     it can also be called per-order when combining a merged pair."""
     line_items = []
     for li in order.get("line_items", []):
+        # Package Protection / Free Returns (Route, Corso, Redo, etc.) are
+        # a purchased service, not a physical item in the parcel — they
+        # should never appear on a customs declaration or need an HS code.
+        # Shopify marks these with requires_shipping: false natively, so we
+        # key off that rather than matching on title text (which breaks the
+        # moment the app's wording changes). Confirmed with Ganesh 2026-08.
+        if li.get("requires_shipping") is False:
+            continue
+
         # Skip items removed/swapped via a Shopify order edit — quantity
         # still reflects the original order, current_quantity reflects
         # what's actually left after the edit. Without this, a removed
