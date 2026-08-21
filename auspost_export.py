@@ -91,6 +91,22 @@ HS_CODE_TABLE = {
     "611231": {"description": "Synthetic training shorts, men's", "us_hts10": "6112310010"},
     "611241": {"description": "Synthetic training shorts, women's", "us_hts10": "6112410010"},
     "640220": {"description": "Footwear thongs/sandals", "us_hts10": "6402200000"},
+
+    # Added 2026-08 after the master-store lookup fix exposed several
+    # product types (belts, bags, spats/tights, t-shirts) that had been
+    # bulk-defaulted to the gi code (620322) in Shopify rather than left
+    # blank — meaning they were resolving "successfully" but with the
+    # WRONG description, not flagging for review. Descriptions and the
+    # spats/tights HS6 (men's cut, applied universally per Ganesh's
+    # instruction) confirmed with Ganesh 2026-08. US HTS-10 values below
+    # are best-effort generic "Other" bucket codes, NOT broker-confirmed —
+    # flagged for follow-up verification, same caveat applies to the
+    # Belt/Bag entries' classification itself (genuinely ambiguous headings).
+    "621710": {"description": "Cotton martial arts belt", "us_hts10": "6217109550"},
+    "420292": {"description": "Duffle bag", "us_hts10": "4202923131"},
+    "610343": {"description": "Polyester leggings and tights", "us_hts10": "6103431550"},
+    "610910": {"description": "Cotton t-shirt", "us_hts10": "6109100027"},
+    "610990": {"description": "Synthetic t-shirt", "us_hts10": "6109901007"},
 }
 
 
