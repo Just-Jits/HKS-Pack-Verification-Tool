@@ -107,6 +107,14 @@ HS_CODE_TABLE = {
     "610343": {"description": "Polyester leggings and tights", "us_hts10": "6103431550"},
     "610910": {"description": "Cotton t-shirt", "us_hts10": "6109100027"},
     "610990": {"description": "Synthetic t-shirt", "us_hts10": "6109901007"},
+
+    # Added 2026-08 while testing order #1488 (True Illusion, Executioner
+    # Muay Thai Shorts). Ganesh gave this code directly (6203.43 - men's
+    # synthetic trousers/breeches/shorts). Note: this is the SAME heading
+    # family as 611231/611241 above, which are labelled "training shorts"
+    # but are actually the 6112.3x/6112.4x swimwear subheadings, not
+    # shorts - those two may be misclassified and worth a second look.
+    "620343": {"description": "Synthetic athletic shorts, men's", "us_hts10": "6203439030"},
 }
 
 
